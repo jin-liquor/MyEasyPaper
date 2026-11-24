@@ -6,7 +6,6 @@ PDF 翻译服务 - 使用 PDFMathTranslate (pdf2zh) 进行学术论文翻译
 from __future__ import annotations
 
 import logging
-import os
 import tempfile
 
 from ..core.config import LLMConfig
@@ -35,12 +34,6 @@ class PDFTranslator:
         self.lang_out = lang_out
         self.thread = thread
         self.llm_config = llm_config or LLMConfig(api_key=api_key, base_url=base_url, model=model)
-
-        # 设置环境变量供 pdf2zh 使用
-        if self.llm_config.provider == "api":
-            os.environ["OPENAILIKED_BASE_URL"] = base_url
-            os.environ["OPENAILIKED_API_KEY"] = api_key
-            os.environ["OPENAILIKED_MODEL"] = model
 
     def translate_pdf(
         self,

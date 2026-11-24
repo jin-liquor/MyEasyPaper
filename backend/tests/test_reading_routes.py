@@ -16,6 +16,7 @@ from app.api.reading_routes import create_reading_router
 from app.core.config import LLMConfig
 from app.models.task import Task, TaskStatus
 from app.models.user import User
+from app.services.ai_client import AIClient, AIError
 from app.services.reading_service import ReadingService
 
 
@@ -79,10 +80,13 @@ def test_chat_uses_owned_paper_and_conversation_without_a_selection(tmp_path, mo
     block = document["blocks"][1]
     captured = []
 
-    async def answer(_self, _prompt, context):
+    async def answer(_self, _prompt, context, image_bytes=None, *, ai_client):
+        assert ai_client is account_client
         captured.append(json.loads(context))
         return {"answer": "论文中的解释。", "evidence_refs": [block["id"], "invented"]}
 
+    account_client = object()
+    monkeypatch.setattr(AIClient, "for_user", lambda user_id: {1: account_client}[user_id])
     monkeypatch.setattr(ReadingService, "ask_model", answer)
     history = [
         {"role": "user", "content": "作者解决什么问题？"},
@@ -121,7 +125,8 @@ def test_chat_accepts_a_pasted_image_as_a_multipart_request(tmp_path, monkeypatc
     Image.new("RGB", (2, 2), "white").save(image, format="JPEG")
     captured = {}
 
-    async def answer(_self, _prompt, context, image_bytes=None):
+    async def answer(_self, _prompt, context, image_bytes=None, *, ai_client):
+        assert ai_client is account_client
         request = json.loads(context)
         captured.update(
             question=request["question"],
@@ -131,6 +136,8 @@ def test_chat_accepts_a_pasted_image_as_a_multipart_request(tmp_path, monkeypatc
         )
         return {"answer": "图片里的内容。", "evidence_refs": []}
 
+    account_client = object()
+    monkeypatch.setattr(AIClient, "for_user", lambda user_id: {1: account_client}[user_id])
     monkeypatch.setattr(ReadingService, "ask_model", answer)
     response = client.post(
         "/api/reading/task-1/ask-image",
@@ -152,3 +159,19 @@ def test_chat_rejects_a_non_image_upload(tmp_path):
         files={"image": ("clipboard.txt", b"not an image", "text/plain")},
     )
     assert response.status_code == 415
+
+
+def test_chat_without_account_configuration_rejects_global_fallback(tmp_path, monkeypatch):
+    client, _ = _client(tmp_path)
+
+    def unconfigured(user_id):
+        assert user_id == 1
+        raise AIError("AI_NOT_CONFIGURED")
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("a provider must not be called")
+
+    monkeypatch.setattr(AIClient, "for_user", unconfigured)
+    monkeypatch.setattr(AIClient, "complete_json", unexpected)
+    response = client.post("/api/reading/task-1/ask", json={"question": "论文讲了什么？"})
+    assert response.status_code == 503

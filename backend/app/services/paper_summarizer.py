@@ -66,11 +66,16 @@ class PaperSummarizer:
         self.base_url = base_url
         self.ai = ai_client or AIClient(LLMConfig(api_key=api_key, model=model, base_url=base_url))
 
-    async def summarize(self, pdf_bytes: bytes) -> dict:
+    @staticmethod
+    def _ai_for_scope(user_id: int | None, fallback: AIClient) -> AIClient:
+        return AIClient.for_user(user_id) if user_id is not None else fallback
+
+    async def summarize(self, pdf_bytes: bytes, user_id: int | None = None) -> dict:
+        ai_client = self._ai_for_scope(user_id, self.ai)
         pages_text = self._extract_text(pdf_bytes)
         context = self._build_context(pages_text)
 
-        return await self._call_llm(context)
+        return await self._call_llm(context, ai_client)
 
     def _extract_text(self, pdf_bytes: bytes) -> list[str]:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -100,12 +105,12 @@ class PaperSummarizer:
 
         return full[:head_budget] + "\n\n[...middle sections omitted for brevity...]\n\n" + full[-tail_budget:]
 
-    async def _call_llm(self, text: str) -> dict:
+    async def _call_llm(self, text: str, ai_client: AIClient) -> dict:
         for attempt in range(3):
             try:
-                return await self.ai.complete_json(SUMMARY_SYSTEM_PROMPT, f"Paper text:\n\n{text}", max_tokens=4096)
+                return await ai_client.complete_json(SUMMARY_SYSTEM_PROMPT, f"Paper text:\n\n{text}", max_tokens=4096)
             except AIError as exc:
-                if self.ai.config.uses_cli or not exc.retryable or attempt == 2:
+                if ai_client.config.uses_cli or not exc.retryable or attempt == 2:
                     raise
                 await asyncio.sleep(2 * (2**attempt))
         raise AIError("摘要生成失败。")

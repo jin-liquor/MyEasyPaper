@@ -145,7 +145,7 @@ class TaskManager:
                     import json
 
                     file_path.with_suffix(".alignment.json").write_text(
-                        json.dumps(result.translation_records, ensure_ascii=False)
+                        json.dumps(result.translation_records, ensure_ascii=False), encoding="utf-8"
                     )
 
             if result.dual_pdf_bytes:

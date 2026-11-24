@@ -31,6 +31,9 @@ def test_default_agent_key_raises_in_production() -> None:
         validate_security(cfg, "production")
 
 
-def test_strong_secrets_pass_in_production() -> None:
+def test_strong_secrets_pass_in_production(monkeypatch) -> None:
+    import base64
+
+    monkeypatch.setenv("EASYPAPER_CREDENTIAL_ENCRYPTION_KEY", base64.urlsafe_b64encode(b"x" * 32).decode())
     cfg = _config(secret="a" * 64, agent_keys=["b" * 64])
     validate_security(cfg, "production")  # must not raise

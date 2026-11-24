@@ -17,8 +17,8 @@ from sqlmodel import Session, select
 
 from ..core.config import AppConfig
 from ..models.gloss_worker import GlossWorkerJob
-from ..models.reading import ReaderBuild, ReaderGloss, ReaderVersion
-from ..models.task import TaskStatus
+from ..models.reading import ReaderBuild, ReaderDocument, ReaderGloss, ReaderVersion
+from ..models.task import Task, TaskStatus
 from ..services.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -337,7 +337,9 @@ class GlossWorkerService:
             task_id = job.task_id
         self.task_manager.set_error(task_id, detail)
 
-    def recover_after_restart(self) -> None:
+    def recover_after_restart(self, *, server_only: bool = False) -> None:
+        if server_only:
+            self._retire_remote_jobs()
         now = datetime.utcnow()
         with Session(self.engine) as session:
             for build in session.exec(select(ReaderBuild).where(ReaderBuild.status == "running")).all():
@@ -357,4 +359,36 @@ class GlossWorkerService:
                 job.claimed_until = None
                 job.updated_at = now
                 session.add(job)
+            session.commit()
+
+    def _retire_remote_jobs(self) -> None:
+        now = datetime.utcnow()
+        detail = "本机处理队列已停用，请在网页上重试以使用账户默认模型。"
+        with Session(self.engine) as session:
+            jobs = session.exec(select(GlossWorkerJob).where(GlossWorkerJob.status.in_(("queued", "claimed")))).all()
+            for job in jobs:
+                job.status, job.error, job.updated_at = "failed", detail, now
+                job.claim_token = job.claimed_until = job.worker_label = None
+                session.add(job)
+                document = session.get(ReaderDocument, job.document_id)
+                build = session.get(ReaderBuild, job.id)
+                if (
+                    document
+                    and document.user_id == job.user_id
+                    and build
+                    and build.document_id == document.id
+                    and build.kind == "gloss"
+                    and build.status in {"awaiting_worker", "claimed"}
+                ):
+                    build.status, build.error, build.updated_at = "error", detail, now
+                    session.add(build)
+                task = session.get(Task, job.task_id)
+                if (
+                    task
+                    and task.user_id == job.user_id
+                    and task.mode == "gloss"
+                    and task.status not in {TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.ERROR}
+                ):
+                    task.status, task.error, task.message = TaskStatus.ERROR, detail, detail
+                    session.add(task)
             session.commit()

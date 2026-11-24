@@ -1,3 +1,4 @@
+import base64
 from datetime import timedelta
 
 import pytest
@@ -55,6 +56,7 @@ def test_production_disables_old_config_entrypoints(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_CONFIG_PATH", str(path))
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("EASYPAPER_SECRET_KEY", "a" * 64)
+    monkeypatch.setenv("EASYPAPER_CREDENTIAL_ENCRYPTION_KEY", base64.urlsafe_b64encode(b"x" * 32).decode())
     get_config.cache_clear()
     try:
         config = get_config()
@@ -127,10 +129,44 @@ def test_closed_registration_and_agent_interfaces(server):
     assert client.get("/api/protected").status_code == 401
 
 
-def test_unconfigured_ai_rejects_before_consuming_upload_or_charging_quota(server, session):
+@pytest.fixture
+def configure_account_ai(client, engine, monkeypatch):
+    monkeypatch.setattr("app.api.ai_settings_routes.engine", engine)
+    monkeypatch.delenv("EASYPAPER_CREDENTIAL_ENCRYPTION_KEYS", raising=False)
+    monkeypatch.delenv("EASYPAPER_CREDENTIAL_ENCRYPTION_ACTIVE_VERSION", raising=False)
+    monkeypatch.setenv("EASYPAPER_CREDENTIAL_ENCRYPTION_KEY", base64.urlsafe_b64encode(b"f" * 32).decode())
+
+    def configure(headers):
+        response = client.post(
+            "/api/settings/ai/providers",
+            headers=headers,
+            json={
+                "name": "Fixture",
+                "base_url": "https://provider.invalid/v1",
+                "protocol": "responses",
+                "api_key": "fixture-account-key",
+                "models": [
+                    {
+                        "model_name": "fixture",
+                        "input_types": ["text"],
+                        "max_output_tokens": 128,
+                        "context_window": 2048,
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 201
+        model_id = response.json()["providers"][0]["models"][0]["id"]
+        assert client.patch("/api/settings/ai/default-model", headers=headers, json={"model_id": model_id}).is_success
+
+    return configure
+
+
+def test_unconfigured_ai_rejects_before_consuming_upload_or_charging_quota(server, session, configure_account_ai):
     from sqlmodel import select
 
     client, headers, config = server
+    assert not config.llm.is_configured
     assert client.post("/api/upload", content=b"invalid").status_code == 401
     for path in (
         "/api/upload",
@@ -142,14 +178,17 @@ def test_unconfigured_ai_rejects_before_consuming_upload_or_charging_quota(serve
     ):
         response = client.post(path, content=b"invalid", headers=headers)
         assert response.status_code == 503
-        assert "尚未配置" in response.json()["detail"]
+        assert response.json()["detail"]["code"] == "AI_NOT_CONFIGURED"
     assert not session.exec(select(DailyUsage)).all()
     assert client.get("/api/protected", headers=headers).status_code == 200
-    config.llm.api_key = "configured-test-key"
-    assert client.post("/api/upload", content=b"example", headers=headers).status_code == 200
+    configure_account_ai(headers)
+    response = client.post("/api/upload/", content=b"example", headers=headers, follow_redirects=False)
+    assert response.status_code == 200
+    assert response.json() == {"size": 7}
+    assert [row.count for row in session.exec(select(DailyUsage)).all()] == [1]
 
 
-def test_features_expose_capabilities_without_credentials(client, monkeypatch):
+def test_features_expose_capabilities_without_credentials(client, monkeypatch, account, session, configure_account_ai):
     config = AppConfig(llm={}, processing={"max_pages": 30, "max_upload_mb": 15})
     monkeypatch.setattr("app.api.auth.get_config", lambda: config)
     data = client.get("/api/auth/features").json()
@@ -162,9 +201,26 @@ def test_features_expose_capabilities_without_credentials(client, monkeypatch):
         "gloss_preparation_site": "server",
         "gloss_worker_configured": False,
     }
-    config.llm.api_key = "private-value"
-    assert client.get("/api/auth/features").json()["ai_available"] is True
-    assert "private-value" not in client.get("/api/auth/features").text
+    config.llm.api_key = "fixture-global-key"
+    assert client.get("/api/auth/features").json()["ai_available"] is False
+    config.llm.api_key = ""
+    headers = {"Authorization": "Bearer " + create_access_token(account.id)}
+    configure_account_ai(headers)
+    second = create_user("second@example.com", "fixture-password-123", session=session)
+    response = client.get("/api/auth/features", headers=headers)
+    assert response.json() == {**data, "ai_available": True}
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert "fixture-account-key" not in response.text
+    assert client.get("/api/auth/features").json()["ai_available"] is False
+    assert (
+        client.get(
+            "/api/auth/features",
+            headers={
+                "Authorization": "Bearer " + create_access_token(second.id),
+            },
+        ).json()["ai_available"]
+        is False
+    )
 
 
 def test_rejects_oversized_body_with_and_without_content_length(server):

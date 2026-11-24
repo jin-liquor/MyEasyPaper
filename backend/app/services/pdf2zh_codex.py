@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import json
 import threading
 from contextlib import contextmanager
 from functools import partial, wraps
+from hashlib import sha256
 from types import SimpleNamespace
 
 from .ai_client import AIClient, AIError
@@ -56,6 +58,9 @@ def _abort_on_fatal_response(do_translate):
     return guarded
 
 
+_PDF_TRANSLATION_FAILURE = "AI_PDF_TRANSLATION_FAILED：当前账户 AI 供应商翻译失败，请检查模型配置或稍后重试。"
+
+
 class CodexTranslationExecutor:
     def __init__(self, ai: AIClient, loop: asyncio.AbstractEventLoop):
         self.ai, self.loop = ai, loop
@@ -80,8 +85,7 @@ class CodexTranslationExecutor:
         try:
             return future.result(timeout=self.ai.config.request_timeout + 5)
         except Exception as exc:
-            label = "Cursor" if self.ai.config.provider == "cursor" else "Codex"
-            message = str(exc) if isinstance(exc, AIError) else f"{label} PDF 翻译已中止，请重试。"
+            message = str(exc) if isinstance(exc, AIError) else _PDF_TRANSLATION_FAILURE
             self.cancel(message)
             raise PDFTranslationAbort(message) from None
         finally:
@@ -108,10 +112,28 @@ def install_pdf2zh_adapter():
             name = "easypaper-codex"
 
             def __init__(self, lang_in, lang_out, executor, prompt, ignore_cache):
-                super().__init__(lang_in, lang_out, executor.ai.model, ignore_cache)
+                ai = executor.ai
                 self.executor, self.prompttext = executor, prompt
+                if ai.runtime:
+                    self.name = "easypaper-acct-v1"
+                    provider, model = ai.runtime["provider"], ai.runtime["model"]
+                    # Only explicitly selected metadata, never credentials or runtime objects.
+                    scope = (
+                        ai.runtime["user_id"],
+                        provider["id"],
+                        provider["protocol"],
+                        provider["base_url"],
+                        model["id"],
+                        ai.model,
+                        model["max_output_tokens"],
+                        model.get("reasoning"),
+                    )
+                    fingerprint = sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
+                    super().__init__(lang_in, lang_out, fingerprint, ignore_cache)
+                else:
+                    super().__init__(lang_in, lang_out, ai.model, ignore_cache)
+                    self.add_cache_impact_parameters("reasoning_effort", ai.config.codex.reasoning_effort)
                 self.add_cache_impact_parameters("prompt", prompt.template if prompt else "translation-v1")
-                self.add_cache_impact_parameters("reasoning_effort", executor.ai.config.codex.reasoning_effort)
 
             def do_translate(self, text):
                 if self.prompttext:
@@ -282,7 +304,7 @@ def pdf2zh_backend(config, ai: AIClient | None = None, loop=None, records=None, 
         **({_RECORDS_KEY: records} if records is not None else {}),
         **({_PAGES_KEY: pages} if pages is not None else {}),
     }
-    if config.provider == "api":
+    if config.provider == "api" and not (ai and getattr(ai, "runtime", False)):
         install_pdf2zh_adapter()
         yield {
             "service": "openailiked",
@@ -300,7 +322,9 @@ def pdf2zh_backend(config, ai: AIClient | None = None, loop=None, records=None, 
         loop = asyncio.new_event_loop()
         thread = threading.Thread(target=loop.run_forever, name="easypaper-pdf-ai", daemon=True)
         thread.start()
-        # Never share a semaphore across unrelated event loops.
+        # Never share semaphores across event loops or drop account ownership.
+        ai = AIClient(config, runtime=ai.runtime if ai is not None else None)
+    elif ai is None:
         ai = AIClient(config)
     executor = CodexTranslationExecutor(ai, loop)
     try:

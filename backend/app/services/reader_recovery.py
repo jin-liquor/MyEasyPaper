@@ -126,6 +126,9 @@ class ReaderRecovery:
         while True:
             try:
                 await self.run_once()
-            except Exception:
-                logger.exception("Annotation recovery failed; retrying on next tick")
+            except Exception as exc:
+                logger.error(
+                    "Annotation recovery failed; retrying on next tick: exception_type=%s",
+                    type(exc).__name__,
+                )
             await asyncio.sleep(5)

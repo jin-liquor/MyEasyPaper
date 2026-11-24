@@ -18,9 +18,8 @@ from ..core.config import get_config
 from ..core.db import engine, get_session
 from ..models.task import TaskStatus
 from ..models.user import User
-from ..services.ai_client import AIError
+from ..services.ai_client import AIClient, AIError
 from ..services.document_processor import DocumentProcessor
-from ..services.gloss_preparation import remote_worker_ready, resolve_gloss_preparation
 from ..services.job_queue import JobQueue
 from ..services.paper_passport import get_or_create_passport
 from ..services.paper_summarizer import PaperSummarizer
@@ -29,7 +28,6 @@ from ..services.pdf_metadata import pdf_title
 from ..services.pdf_validation import validate_pdf
 from ..services.synced_reader import GlossImportError
 from ..services.task_manager import TaskManager
-from ..services.user_preferences import get_preferences
 from .deps import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -94,42 +92,17 @@ def create_router(
                 result_pdf_path=current.result_pdf_path,
                 result_dual_pdf_path=current.result_dual_pdf_path,
             )
-            with Session(engine) as session:
-                prefs = get_preferences(session, current.user_id)
-            preparation = resolve_gloss_preparation(cfg, prefs)
-            if preparation == "remote_worker":
-                if gloss_worker_service is None:
-                    task_manager.set_error(task_id, "本地点读处理器服务不可用，请联系管理员。")
-                    return
-                if not remote_worker_ready(cfg):
-                    task_manager.set_error(
-                        task_id,
-                        "服务器尚未配置本地点读处理器令牌，无法使用本机准备。请联系管理员或改用服务器准备。",
-                    )
-                    return
-                try:
-                    document_id = await reader.prepare_gloss_index(paper)
-                    gloss_worker_service.enqueue(
-                        task_id=current.task_id,
-                        document_id=document_id,
-                        user_id=current.user_id,
-                    )
-                except GlossImportError as exc:
-                    task_manager.set_error(task_id, str(exc))
-                    return
-                report(TaskStatus.REWRITING, 15, "已排队，等待本地点读处理器领取…")
-                return
             try:
                 await reader.prepare_gloss_for_task(paper, on_batch)
             except GlossImportError as exc:
                 task_manager.set_error(task_id, str(exc))
                 return
-            except AIError:
-                logger.exception("原文点读准备超时: %s", task_id)
+            except AIError as exc:
+                logger.error("原文点读准备失败: task_id=%s exception_type=%s", task_id, type(exc).__name__)
                 task_manager.set_error(task_id, "点读释义准备超时，已写好的部分会保留。请重试，会从停下的地方继续。")
                 return
-            except Exception:
-                logger.exception("原文点读准备失败: %s", task_id)
+            except Exception as exc:
+                logger.error("原文点读准备失败: task_id=%s exception_type=%s", task_id, type(exc).__name__)
                 task_manager.set_error(task_id, "原文点读没有准备完成，请重试。原文仍可阅读。")
                 return
             report(TaskStatus.COMPLETED, 100, "原文点读已准备好")
@@ -148,6 +121,7 @@ def create_router(
                     task.filename,
                     mode=task.mode,
                     highlight=task.highlight,
+                    user_id=current.user_id,
                 )
 
         run = start(process())
@@ -236,8 +210,8 @@ def create_router(
         except (httpx.TimeoutException, TimeoutError) as exc:
             raise HTTPException(status_code=504, detail="Download timed out") from exc
         except Exception as exc:
-            logger.exception("Unexpected error downloading PDF from URL")
-            raise HTTPException(status_code=502, detail=f"Download failed: {exc}") from exc
+            logger.error("Unexpected error downloading PDF: exception_type=%s", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Download failed") from exc
 
         file_bytes = result.file_bytes
         filename = result.filename
@@ -440,7 +414,7 @@ def create_router(
             try:
                 return await reading_service.summary(task, await reading_service.document(task))
             except Exception as exc:
-                logger.exception("Reading summary generation failed")
+                logger.error("Reading summary generation failed: exception_type=%s", type(exc).__name__)
                 raise HTTPException(status_code=502, detail="摘要生成失败，请重试") from exc
 
         # Return cached summary
@@ -457,13 +431,13 @@ def create_router(
             api_key=cfg.llm.api_key,
             model=cfg.llm.model,
             base_url=cfg.llm.base_url,
-            ai_client=processor.ai,
+            ai_client=AIClient.for_user(user.id),
         )
 
         try:
-            summary = await summarizer.summarize(pdf_bytes)
+            summary = await summarizer.summarize(pdf_bytes, user_id=user.id)
         except Exception as exc:
-            logger.exception("Summary generation failed")
+            logger.error("Summary generation failed: exception_type=%s", type(exc).__name__)
             raise HTTPException(status_code=500, detail="摘要生成失败，请稍后重试") from exc
 
         # Cache result

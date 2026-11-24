@@ -44,7 +44,7 @@ def pdf_bytes(text, chinese=False):
 
 
 @pytest.fixture
-def reader(tmp_path):
+def reader(tmp_path, monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     SQLModel.metadata.create_all(engine)
     source = tmp_path / "original.pdf"
@@ -62,8 +62,11 @@ def reader(tmp_path):
         storage=SimpleNamespace(temp_dir=str(tmp_path / "library")),
     )
     reading = ReadingService(config, engine)
+    from app.services.ai_client import AIClient
 
-    async def align(_prompt, context):
+    monkeypatch.setattr(AIClient, "for_user", classmethod(lambda cls, _user_id: reading.ai))
+
+    async def align(_prompt, context, **_kwargs):
         request = json.loads(context)
         # The model is stubbed. The API must still ground every proposed substring in the PDF.
         candidates = request["candidates"]
@@ -161,7 +164,7 @@ def test_legacy_gloss_span_is_enriched_on_first_click_and_cached(reader):
 
     calls = []
 
-    async def enrich(prompt, context):
+    async def enrich(prompt, context, **_kwargs):
         calls.append((prompt, json.loads(context)))
         return {"ipa": "ˈmɛθəd", "simple_en": "A way to do something."}
 
@@ -551,7 +554,7 @@ def test_reply_uses_parent_positions_without_matching_icon_text(reader, parent_r
     reader.client.put(url(reader), json=annotation_body(reader))
     parent = saved(reader)
 
-    async def unavailable(*_):
+    async def unavailable(*_, **_kwargs):
         pytest.fail("A reply with a known parent must not call the language model")
 
     reader.reading.ask_model = unavailable
@@ -599,7 +602,7 @@ def test_reply_uses_parent_positions_without_matching_icon_text(reader, parent_r
 
 
 def test_missing_reply_parent_does_not_send_unrelated_icon_text_to_model(reader):
-    async def unavailable(*_):
+    async def unavailable(*_, **_kwargs):
         pytest.fail("An orphan reply must retain its source without guessing from the icon's text")
 
     reader.reading.ask_model = unavailable
@@ -618,7 +621,7 @@ def test_missing_reply_parent_does_not_send_unrelated_icon_text_to_model(reader)
 
 
 def test_bilingual_copy_is_immediate_even_when_semantic_service_is_unavailable(reader):
-    async def unavailable(*_):
+    async def unavailable(*_, **_kwargs):
         raise RuntimeError("offline")
 
     reader.reading.ask_model = unavailable
@@ -765,14 +768,14 @@ def test_full_sentence_without_final_punctuation_does_not_need_phrase_refinement
     units = pdf_index(pdf_bytes(target, True))["units"]
     phases = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         phases.append(request.get("phase", "match"))
         return {"matches": [{"id": units[0]["id"], "quote": target, "confidence": 0.99}]}
 
     reader.reading.ask_model = respond
     found = asyncio.run(
-        reader.service._match_selection(EN.rstrip("."), [{"quote": EN.rstrip("."), "context": EN}], units)
+        reader.service._match_selection(EN.rstrip("."), [{"quote": EN.rstrip("."), "context": EN}], units, user_id=1)
     )
     assert found and phases == ["match"]
 
@@ -784,7 +787,7 @@ def test_single_letter_from_next_word_does_not_expand_a_translated_highlight(rea
     units = pdf_index(pdf_bytes(target, True))["units"]
     requests = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         requests.append(request)
         selection = request.get("selection", "This knowledge exists in abundance,")
@@ -802,7 +805,9 @@ def test_single_letter_from_next_word_does_not_expand_a_translated_highlight(rea
         }
 
     reader.reading.ask_model = respond
-    found = asyncio.run(reader.service._match_selection(selected, [{"quote": selected, "context": sentence}], units))
+    found = asyncio.run(
+        reader.service._match_selection(selected, [{"quote": selected, "context": sentence}], units, user_id=1)
+    )
     assert [m["quote"] for m in found] == ["这些知识大量存在"]
     assert found[0]["unmatched_fragments"] == ["s"]
     assert all(r["selection"] == "This knowledge exists in abundance," for r in requests if "selection" in r)
@@ -814,7 +819,7 @@ def test_phrase_scope_rejects_support_from_unselected_source_context(reader):
     target = "这些事实广泛存在，散布在论文中。"
     units = pdf_index(pdf_bytes(target, True))["units"]
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         return {
             "matches": [
                 {"id": units[0]["id"], "quote": target, "confidence": 0.99, "source_index": 0, "source_quote": sentence}
@@ -822,7 +827,9 @@ def test_phrase_scope_rejects_support_from_unselected_source_context(reader):
         }
 
     reader.reading.ask_model = respond
-    found = asyncio.run(reader.service._match_selection(selected, [{"quote": selected, "context": sentence}], units))
+    found = asyncio.run(
+        reader.service._match_selection(selected, [{"quote": selected, "context": sentence}], units, user_id=1)
+    )
     assert found == []
 
 
@@ -831,7 +838,7 @@ def test_phrase_partition_does_not_claim_complete_coverage_after_dropping_a_qual
     units = pdf_index(pdf_bytes("这些知识存在，散布在论文中。", True))["units"]
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         calls.append(context)
         request = json.loads(context)
         if request.get("phase"):
@@ -852,7 +859,7 @@ def test_phrase_partition_does_not_claim_complete_coverage_after_dropping_a_qual
     reader.reading.ask_model = respond
     found = asyncio.run(
         reader.service._match_selection(
-            selected, [{"quote": selected, "context": selected + ", scattered through papers."}], units
+            selected, [{"quote": selected, "context": selected + ", scattered through papers."}], units, user_id=1
         )
     )
     assert found[0]["unmatched_fragments"] == ["in abundance"]
@@ -864,7 +871,7 @@ def test_reordered_translation_keeps_discontiguous_selected_phrases(reader):
     units = pdf_index(pdf_bytes(target))["units"]
     selected = "代理执行机器学习"
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase") == "phrase_boundaries":
             return {
@@ -897,7 +904,7 @@ def test_reordered_translation_keeps_discontiguous_selected_phrases(reader):
     reader.reading.ask_model = respond
     found = asyncio.run(
         reader.service._match_selection(
-            selected, [{"quote": selected, "context": selected + "研究的更大部分。"}], units
+            selected, [{"quote": selected, "context": selected + "研究的更大部分。"}], units, user_id=1
         )
     )
     assert [m["quote"] for m in found] == ["Agents execute", "machine learning"]
@@ -936,7 +943,7 @@ def test_simplified_matching_uses_original_user_selection_even_with_a_broad_engl
     requests = []
     previous = reader.reading.ask_model
 
-    async def respond(prompt, context):
+    async def respond(prompt, context, **_kwargs):
         request = json.loads(context)
         if any(u["text"] == SIMPLE for u in request["candidates"]):
             requests.append(request)
@@ -965,7 +972,7 @@ def test_partial_english_selection_does_not_repeat_the_same_simplified_request(r
     simple_requests = []
     previous = reader.reading.ask_model
 
-    async def respond(prompt, context):
+    async def respond(prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase") == "coverage":
             return {
@@ -1053,7 +1060,7 @@ def test_edit_from_another_view_preserves_source_geometry_and_deletion_is_recove
 
 
 def test_missing_or_failed_semantic_alignment_keeps_original_annotation(reader):
-    async def unavailable(*_args):
+    async def unavailable(*_args, **_kwargs):
         raise RuntimeError("offline")
 
     reader.reading.ask_model = unavailable
@@ -1068,7 +1075,7 @@ def test_missing_or_failed_semantic_alignment_keeps_original_annotation(reader):
 
 
 def test_model_cannot_invent_a_target_quote(reader):
-    async def invalid(_prompt, context):
+    async def invalid(_prompt, context, **_kwargs):
         candidates = json.loads(context)["candidates"]
         return {"matches": [{"id": candidates[0]["id"], "quote": "An invented result", "confidence": 1}]}
 
@@ -1081,7 +1088,7 @@ def test_model_cannot_invent_a_target_quote(reader):
 def test_invalid_combined_model_quote_is_retried_with_validation_feedback(reader):
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         calls.append(request)
         candidates = request["candidates"]
@@ -1103,7 +1110,7 @@ def test_sync_drops_extra_model_matches_with_a_different_numeric_result(reader):
         reader.source.parent,
     )
 
-    async def overmatch(_prompt, context):
+    async def overmatch(_prompt, context, **_kwargs):
         return {
             "matches": [
                 {"id": c["id"], "quote": c["text"], "confidence": 0.99} for c in json.loads(context)["candidates"]
@@ -1157,7 +1164,7 @@ def test_short_selected_phrase_is_matched_with_its_source_sentence_context(reade
     body["version_id"] = chinese.id
     body["data"].update(rect=union(segments), segmentRects=segments)
 
-    async def contextual(_prompt, context):
+    async def contextual(_prompt, context, **_kwargs):
         request = json.loads(context)
         if "模型的先验知识很广泛" not in json.dumps(request.get("source_context"), ensure_ascii=False):
             return {"matches": []}
@@ -1188,7 +1195,7 @@ def test_reformatted_revision_relocates_verified_words_without_another_model_cal
             json.loads(original.index_json),
         )
 
-    async def unavailable(*_args):
+    async def unavailable(*_args, **_kwargs):
         raise RuntimeError("No model call should be needed for the same words in a new layout")
 
     reader.reading.ask_model = unavailable
@@ -1214,7 +1221,7 @@ def test_model_straight_apostrophe_matches_the_pdf_typographic_apostrophe(reader
         reader.source.parent,
     )
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         return {
             "matches": [
                 {
@@ -1287,7 +1294,7 @@ def test_fragment_matching_trims_unselected_claims_after_finding_the_sentence(re
     )
     phases = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         phases.append(request.get("phase"))
         return {
@@ -1318,7 +1325,7 @@ def test_precise_phrase_does_not_get_sent_for_a_second_refinement(reader):
     units = pdf_index(pdf_bytes("The model is broad but fixed."))["units"]
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         calls.append(json.loads(context))
         return {
             "matches": [
@@ -1334,7 +1341,9 @@ def test_precise_phrase_does_not_get_sent_for_a_second_refinement(reader):
 
     reader.reading.ask_model = respond
     result = asyncio.run(
-        reader.service._match("是固定的", units, [{"selected": "是固定的", "sentence": "模型很广泛但是固定的。"}])
+        reader.service._match(
+            "是固定的", units, [{"selected": "是固定的", "sentence": "模型很广泛但是固定的。"}], user_id=1
+        )
     )
     assert [p["quote"] for p in result] == ["fixed"]
     assert len(calls) == 1
@@ -1345,7 +1354,7 @@ def test_marked_source_span_extracts_only_the_equivalent_target_phrase(reader):
 
     units = pdf_index(pdf_bytes("The model knows many things but cannot change."))["units"]
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase"):
             assert "selection" not in request
@@ -1366,7 +1375,7 @@ def test_marked_source_span_extracts_only_the_equivalent_target_phrase(reader):
     reader.reading.ask_model = respond
     result = asyncio.run(
         reader.service._match(
-            "fixed", units, [{"selected": "fixed", "sentence": "The model's prior is broad but fixed."}]
+            "fixed", units, [{"selected": "fixed", "sentence": "The model's prior is broad but fixed."}], user_id=1
         )
     )
     assert [p["quote"] for p in result] == ["cannot change"]
@@ -1387,7 +1396,7 @@ def test_long_selection_keeps_verified_fragments_visible_when_a_version_omits_a_
     body["version_id"] = source.id
     body["data"].update(rect=union(segments), segmentRects=segments)
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase") == "coverage":
             return {"coverage": [{"source_index": 0, "match_indices": [0], "complete": True, "confidence": 0.99}]}
@@ -1431,7 +1440,7 @@ def test_old_revision_partial_match_does_not_mark_current_versions_incomplete(re
     )
 
     # An explicit historical association is preserved, but does not describe current-view coverage.
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         return {
             "matches": [
@@ -1448,7 +1457,7 @@ def test_old_revision_partial_match_does_not_mark_current_versions_incomplete(re
 
 
 def test_manual_association_is_saved_when_model_is_unavailable(reader):
-    async def unavailable(*_args):
+    async def unavailable(*_args, **_kwargs):
         raise RuntimeError("offline")
 
     reader.reading.ask_model = unavailable
@@ -1564,7 +1573,7 @@ def test_new_generated_revision_keeps_old_files_and_reprojects_existing_annotati
     reader.client.put(url(reader), json=annotation_body(reader))
     before = {v.id for v in reader.service.versions(reader.bundle["document_id"])}
 
-    def translate(source, filename, task_id, mode, loop, records):
+    def translate(source, filename, task_id, mode, loop, records, **kwargs):
         assert mode == "simplify"
         records.append({"source": EN, "target": "The method needs 30% less memory.", "page": "0"})
         return (
@@ -1699,7 +1708,7 @@ def test_phrase_refinement_can_restore_missing_negation(reader):
     correct = "not organized for any particular task"
     calls = []
 
-    async def model(_prompt, context):
+    async def model(_prompt, context, **_kwargs):
         request = json.loads(context)
         calls.append(request.get("phase", "match"))
         if request.get("phase") == "phrase_boundaries":
@@ -1711,7 +1720,7 @@ def test_phrase_refinement_can_restore_missing_negation(reader):
     reader.reading.ask_model = model
     quote = "organized for no task in particular"
     context = [{"selected": quote, "sentence": "This knowledge is abundant, yet organized for no task in particular."}]
-    result = asyncio.run(reader.service._match(quote, candidates, context))
+    result = asyncio.run(reader.service._match(quote, candidates, context, user_id=1))
     assert [r["quote"] for r in result] == [correct]
 
 
@@ -1729,7 +1738,7 @@ def test_retry_rechecks_an_existing_wrong_projection(reader):
     calls = []
     previous = reader.reading.ask_model
 
-    async def spy(*args):
+    async def spy(*args, **_kwargs):
         calls.append(1)
         return await previous(*args)
 
@@ -1752,7 +1761,7 @@ def test_background_retry_preserves_reviewed_extent_but_explicit_retry_rechecks_
     calls = []
     previous = reader.reading.ask_model
 
-    async def spy(*args):
+    async def spy(*args, **_kwargs):
         calls.append(args)
         return await previous(*args)
 
@@ -1768,7 +1777,7 @@ def test_background_retry_preserves_reviewed_extent_but_explicit_retry_rechecks_
 def test_partial_match_resumes_after_reopening(reader):
     previous = reader.reading.ask_model
 
-    async def missing_simple(prompt, context):
+    async def missing_simple(prompt, context, **_kwargs):
         request = json.loads(context)
         if any("This method needs" in c["text"] for c in request["candidates"]):
             return {"matches": []}
@@ -1929,7 +1938,7 @@ def test_selection_does_not_silently_drop_second_sentence(reader):
         both.insert_pdf(zh)
         reader.service.snapshot(doc, "bilingual", both.tobytes(), folder, source)
 
-    async def incomplete(_prompt, context):
+    async def incomplete(_prompt, context, **_kwargs):
         candidates = json.loads(context)["candidates"]
         first = next(c for c in candidates if "memory" in c["text"] or "内存" in c["text"])
         return {"matches": [{"id": first["id"], "quote": first["text"], "confidence": 0.99}]}
@@ -1955,7 +1964,7 @@ def test_completed_original_projection_is_visible_while_simple_is_running(reader
     async def scenario():
         reached_simple, release_simple = asyncio.Event(), asyncio.Event()
 
-        async def delayed(prompt, context):
+        async def delayed(prompt, context, **_kwargs):
             request = json.loads(context)
             if any("This method needs" in c["text"] for c in request["candidates"]):
                 reached_simple.set()
@@ -1986,7 +1995,7 @@ def test_missing_negation_is_rejected_with_actionable_retry_feedback(reader):
     units = pdf_index(pdf_bytes("The data is not organized for a task."))["units"]
     requests = []
 
-    async def omit_negation(_prompt, context):
+    async def omit_negation(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase") == "coverage":
             return {"coverage": [{"source_index": 0, "match_indices": [0], "complete": False, "confidence": 0.99}]}
@@ -1994,7 +2003,7 @@ def test_missing_negation_is_rejected_with_actionable_retry_feedback(reader):
         return {"matches": [{"id": units[0]["id"], "quote": "organized for a task", "confidence": 0.99}]}
 
     reader.reading.ask_model = omit_negation
-    assert asyncio.run(reader.service._match("没有为任务组织", units)) == []
+    assert asyncio.run(reader.service._match("没有为任务组织", units, user_id=1)) == []
     assert len(requests) == 2
     assert "negation" in requests[1]["validation_feedback"][0]
 
@@ -2010,7 +2019,7 @@ def test_lexical_negation_requires_semantic_confirmation_instead_of_an_operator(
     units = pdf_index(pdf_bytes(target))["units"]
     phases = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         request = json.loads(context)
         phases.append(request.get("phase", "match"))
         if request.get("phase") == "coverage":
@@ -2018,13 +2027,13 @@ def test_lexical_negation_requires_semantic_confirmation_instead_of_an_operator(
         return {"matches": [{"id": units[0]["id"], "quote": target, "confidence": 0.99}]}
 
     reader.reading.ask_model = respond
-    matches = asyncio.run(reader.service._match(source, units))
+    matches = asyncio.run(reader.service._match(source, units, user_id=1))
     assert [m["quote"] for m in matches] == [target]
     assert phases == ["match", "coverage"]
 
 
 def test_unsuccessful_alignment_finishes_instead_of_claiming_it_is_still_running(reader):
-    async def missing(*_):
+    async def missing(*_, **_kwargs):
         return {"matches": []}
 
     reader.reading.ask_model = missing
@@ -2035,7 +2044,7 @@ def test_unsuccessful_alignment_finishes_instead_of_claiming_it_is_still_running
 def test_alignment_deadline_retains_completed_projections_and_finishes(reader, monkeypatch):
     monkeypatch.setattr("app.services.synced_reader.ALIGNMENT_TIMEOUT_SECONDS", 0.1, raising=False)
 
-    async def stalled(_prompt, context):
+    async def stalled(_prompt, context, **_kwargs):
         candidates = json.loads(context)["candidates"]
         if any(u["text"] == SIMPLE for u in candidates):
             await asyncio.Event().wait()
@@ -2097,7 +2106,7 @@ def test_stalled_model_request_is_retried_within_the_alignment_budget(reader, mo
     reader.reading.ai.complete_json = respond
 
     async def scenario():
-        matches = await asyncio.wait_for(reader.service._match(ZH, units), 0.5)
+        matches = await asyncio.wait_for(reader.service._match(ZH, units, user_id=1), 0.5)
         assert matches[0]["quote"] == SIMPLE
         assert len(calls) == 2
 
@@ -2115,7 +2124,7 @@ def test_model_queue_wait_does_not_consume_the_response_timeout(reader, monkeypa
 
     async def scenario():
         await reader.reading._semaphore.acquire()
-        pending = asyncio.create_task(reader.service._ask_model("test", "{}"))
+        pending = asyncio.create_task(reader.service._ask_model("test", "{}", user_id=1))
         try:
             await asyncio.sleep(0.08)
             assert not pending.done(), "Request expired before it reached the model"
@@ -2132,7 +2141,7 @@ def test_partial_selection_needs_only_one_grounded_model_response(reader):
     units = pdf_index(pdf_bytes("该方法节省内存，错误只有在运行之后才会显现。", True))["units"]
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         calls.append(json.loads(context))
         return {
             "matches": [
@@ -2147,7 +2156,9 @@ def test_partial_selection_needs_only_one_grounded_model_response(reader):
         }
 
     reader.reading.ask_model = respond
-    found = asyncio.run(reader.service._match_selection(selected, [{"quote": selected, "context": source}], units))
+    found = asyncio.run(
+        reader.service._match_selection(selected, [{"quote": selected, "context": source}], units, user_id=1)
+    )
     assert [m["quote"] for m in found] == ["错误只有在运行之后才会显现"]
     assert len(calls) == 1
 
@@ -2157,7 +2168,7 @@ def test_discontiguous_source_grammar_is_verified_without_invented_ellipses(read
     selected = "只有在预算用完后才会显现"
     units = pdf_index(pdf_bytes("Errors appear only after the budget is spent."))["units"]
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         if compact:
             return {
                 "alignments": [
@@ -2193,7 +2204,7 @@ def test_discontiguous_source_grammar_is_verified_without_invented_ellipses(read
 
     reader.reading.ask_model = respond
     found = asyncio.run(
-        reader.service._match_selection(selected, [{"quote": selected, "context": "错误" + selected}], units)
+        reader.service._match_selection(selected, [{"quote": selected, "context": "错误" + selected}], units, user_id=1)
     )
     assert [m["quote"] for m in found] == ["appear only after", "the budget is spent"]
     assert not any(m.get("unmatched_fragments") for m in found)
@@ -2203,7 +2214,7 @@ def test_repeated_complete_selection_reuses_matching_without_sharing_mutable_res
     units = pdf_index(pdf_bytes("This is fixed."))["units"]
     calls = []
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         calls.append(1)
         return {
             "matches": [
@@ -2221,9 +2232,9 @@ def test_repeated_complete_selection_reuses_matching_without_sharing_mutable_res
 
     async def scenario():
         context = [{"selected": "是固定的", "sentence": "模型的知识是固定的。"}]
-        first = await reader.service._match("是固定的", units, context)
+        first = await reader.service._match("是固定的", units, context, user_id=1)
         first[0]["quote"] = "client mutation"
-        second = await reader.service._match("是固定的", units, context)
+        second = await reader.service._match("是固定的", units, context, user_id=1)
         assert second[0]["quote"] == "fixed"
         assert len(calls) == 1
 
@@ -2237,7 +2248,7 @@ def test_different_marks_in_the_same_sentence_reuse_alignment_after_restart(read
     sentence = "模型很广泛，但保持固定。"
     calls = []
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         calls.append(1)
         return {
             "matches": [
@@ -2254,6 +2265,7 @@ def test_different_marks_in_the_same_sentence_reuse_alignment_after_restart(read
             units,
             [{"selected": "模型很广泛", "sentence": sentence}],
             document_id=reader.bundle["document_id"],
+            user_id=1,
         )
         assert [m["quote"] for m in first] == ["The model is broad"]
         restarted = SyncedReader(reader.reading)
@@ -2262,6 +2274,7 @@ def test_different_marks_in_the_same_sentence_reuse_alignment_after_restart(read
             units,
             [{"selected": "但保持固定", "sentence": sentence}],
             document_id=reader.bundle["document_id"],
+            user_id=1,
         )
         assert [m["quote"] for m in second] == ["but", "stays fixed"]
         assert len(calls) == 1
@@ -2274,7 +2287,7 @@ def test_conjunction_cannot_expand_to_an_unselected_action(reader):
     units = pdf_index(pdf_bytes("The model is broad and makes mistakes, and problems appear."))["units"]
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         calls.append(json.loads(context))
         if len(calls) == 1:
             pairs = [("而", "and makes mistakes"), ("错误会出现", "problems appear")]
@@ -2289,7 +2302,7 @@ def test_conjunction_cannot_expand_to_an_unselected_action(reader):
 
     reader.reading.ask_model = respond
     result = asyncio.run(
-        reader.service._match("而错误会出现", units, [{"selected": "而错误会出现", "sentence": source}])
+        reader.service._match("而错误会出现", units, [{"selected": "而错误会出现", "sentence": source}], user_id=1)
     )
     assert "makes mistakes" not in " ".join(m["quote"] for m in result)
     assert [m["quote"] for m in result] == ["and problems appear"]
@@ -2306,7 +2319,7 @@ def test_phrase_cache_respects_document_selection_revision_and_retry(reader, cha
     document_id = reader.bundle["document_id"]
     calls = []
 
-    async def respond(_prompt, context):
+    async def respond(_prompt, context, **_kwargs):
         candidates = json.loads(context)["candidates"]
         calls.append(1)
         pairs = [("模型很广泛", "The model is broad"), ("但保持固定", "but stays fixed")]
@@ -2330,7 +2343,7 @@ def test_phrase_cache_respects_document_selection_revision_and_retry(reader, cha
     async def scenario():
         nonlocal document_id, units
         context = [{"selected": "模型很广泛", "sentence": sentence}]
-        await reader.service._match("模型很广泛", units, context, document_id=document_id)
+        await reader.service._match("模型很广泛", units, context, document_id=document_id, user_id=1)
         assert len(calls) == 1
         selected = "模型很广泛"
         if change == "document":
@@ -2350,7 +2363,7 @@ def test_phrase_cache_respects_document_selection_revision_and_retry(reader, cha
             reader.service._phrases.invalidate(document_id)
         restarted = SyncedReader(reader.reading)
         result = await restarted._match(
-            selected, units, [{"selected": selected, "sentence": sentence}], document_id=document_id
+            selected, units, [{"selected": selected, "sentence": sentence}], document_id=document_id, user_id=1
         )
         assert len(calls) == 2
         assert [m["quote"] for m in result] == (["fixed"] if change == "selection" else ["The model is broad"])
@@ -2368,7 +2381,7 @@ def test_simultaneous_different_selections_share_one_sentence_request(reader):
     async def scenario():
         started, release = asyncio.Event(), asyncio.Event()
 
-        async def respond(_prompt, _context):
+        async def respond(_prompt, _context, **_kwargs):
             calls.append(1)
             started.set()
             await release.wait()
@@ -2393,6 +2406,7 @@ def test_simultaneous_different_selections_share_one_sentence_request(reader):
                 units,
                 [{"selected": selected, "sentence": sentence}],
                 document_id=reader.bundle["document_id"],
+                user_id=1,
             )
 
         first = asyncio.create_task(match("模型很广泛"))
@@ -2414,7 +2428,7 @@ def test_completed_whole_selection_cache_survives_restart(reader):
     units = pdf_index(pdf_bytes("The model stays fixed."))["units"]
     calls = []
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         calls.append(1)
         return {"matches": [{"id": units[0]["id"], "quote": "The model stays fixed.", "confidence": 0.99}]}
 
@@ -2423,10 +2437,12 @@ def test_completed_whole_selection_cache_survives_restart(reader):
     async def scenario():
         selected = "模型保持固定。"
         context = [{"selected": selected, "sentence": selected}]
-        first = await reader.service._match(selected, units, context, document_id=reader.bundle["document_id"])
+        first = await reader.service._match(
+            selected, units, context, document_id=reader.bundle["document_id"], user_id=1
+        )
         assert first
         second = await SyncedReader(reader.reading)._match(
-            selected, units, context, document_id=reader.bundle["document_id"]
+            selected, units, context, document_id=reader.bundle["document_id"], user_id=1
         )
         assert second == first
         assert len(calls) == 1
@@ -2513,7 +2529,7 @@ def test_repeated_source_word_is_located_by_the_other_exact_phrase(reader):
     units = pdf_index(pdf_bytes("Mistakes surface only after misconfiguration."))["units"]
     calls = []
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         calls.append(1)
         return {
             "alignments": [
@@ -2532,7 +2548,7 @@ def test_repeated_source_word_is_located_by_the_other_exact_phrase(reader):
 
     reader.reading.ask_model = respond
     found = asyncio.run(
-        reader.service._match_selection(selected, [{"quote": selected, "context": "而" + selected}], units)
+        reader.service._match_selection(selected, [{"quote": selected, "context": "而" + selected}], units, user_id=1)
     )
     assert [m["quote"] for m in found] == ["Mistakes", "surface only after", "misconfiguration"]
     assert not any(m.get("unmatched_fragments") for m in found)
@@ -2543,7 +2559,7 @@ def test_two_target_phrases_cannot_reuse_the_same_source_word(reader):
     selected = "而错误只有在错误配置后才会显现"
     units = pdf_index(pdf_bytes("and making mistakes, problems surface only after misconfiguration."))["units"]
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         return {
             "alignments": [
                 {
@@ -2561,7 +2577,9 @@ def test_two_target_phrases_cannot_reuse_the_same_source_word(reader):
 
     reader.reading.ask_model = respond
     found = asyncio.run(
-        reader.service._match_selection(selected, [{"quote": selected, "context": "在任务内，" + selected}], units)
+        reader.service._match_selection(
+            selected, [{"quote": selected, "context": "在任务内，" + selected}], units, user_id=1
+        )
     )
     assert [m["quote"] for m in found] == ["misconfiguration"]
     assert found[0]["unmatched_fragments"]
@@ -2575,14 +2593,14 @@ def test_partial_projection_is_visible_while_semantic_coverage_is_checked(reader
         checking, release = asyncio.Event(), asyncio.Event()
         previous = reader.service._match_selection
 
-        async def match(quote, parts, candidates):
-            matches = await previous(quote, parts, candidates)
+        async def match(quote, parts, candidates, *, user_id):
+            matches = await previous(quote, parts, candidates, user_id=user_id)
             if any(u["text"] == SIMPLE for u in candidates):
                 for m in matches:
                     m["unmatched_fragments"] = ["源语言语法片段"]
             return matches
 
-        async def coverage(parts, _matches):
+        async def coverage(parts, _matches, **_kwargs):
             checking.set()
             await release.wait()
             return [] if complete else [p["quote"] for p in parts]
@@ -2618,7 +2636,7 @@ def test_simple_projection_can_finish_before_original_matching(reader):
         started, release = asyncio.Event(), asyncio.Event()
         previous = reader.reading.ask_model
 
-        async def respond(prompt, context):
+        async def respond(prompt, context, **_kwargs):
             if any(u["text"] == EN for u in json.loads(context)["candidates"]):
                 started.set()
                 await release.wait()
@@ -2653,7 +2671,7 @@ def test_slow_chinese_matching_does_not_hold_back_the_simple_version(reader):
         chinese_started, simple_started, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         previous = reader.reading.ask_model
 
-        async def respond(prompt, context):
+        async def respond(prompt, context, **_kwargs):
             candidates = json.loads(context)["candidates"]
             if any(u["text"] == ZH for u in candidates):
                 chinese_started.set()
@@ -2693,7 +2711,7 @@ def test_alignment_deadline_does_not_overwrite_concurrent_edits(reader, monkeypa
     async def scenario():
         reached = asyncio.Event()
 
-        async def stalled(*_):
+        async def stalled(*_, **_kwargs):
             reached.set()
             await asyncio.Event().wait()
 
@@ -2726,11 +2744,11 @@ def test_alignment_deadline_does_not_overwrite_concurrent_edits(reader, monkeypa
 def test_split_positive_and_negative_fragments_keep_the_negated_operator(reader):
     units = pdf_index(pdf_bytes("It saves memory. It does not run faster."))["units"]
 
-    async def respond(_prompt, _context):
+    async def respond(_prompt, _context, **_kwargs):
         return {"matches": [{"id": u["id"], "quote": u["text"], "confidence": 0.99} for u in units]}
 
     reader.reading.ask_model = respond
-    found = asyncio.run(reader.service._match("节省内存，但不会运行得更快。", units))
+    found = asyncio.run(reader.service._match("节省内存，但不会运行得更快。", units, user_id=1))
     assert [m["quote"] for m in found] == [u["text"] for u in units]
 
 
@@ -2738,7 +2756,7 @@ def test_merged_sentence_requires_explicit_coverage_of_both_selected_sentences(r
     units = pdf_index(pdf_bytes("It saves memory and runs faster."))["units"]
     parts = [{"quote": "它节省内存。"}, {"quote": "它运行更快。"}]
 
-    async def merged(_prompt, context):
+    async def merged(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request.get("phase") == "coverage":
             assert [h["text"] for h in request["highlights"]] == [units[0]["text"]]
@@ -2750,7 +2768,7 @@ def test_merged_sentence_requires_explicit_coverage_of_both_selected_sentences(r
         return {"matches": [{"id": units[0]["id"], "quote": units[0]["text"], "confidence": 0.99}]}
 
     reader.reading.ask_model = merged
-    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units))
+    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units, user_id=1))
     assert len(matches) == 1
     assert not matches[0].get("unmatched_fragments")
 
@@ -2759,7 +2777,7 @@ def test_coverage_audit_reports_the_actual_missing_sentence(reader):
     units = pdf_index(pdf_bytes("It saves memory."))["units"]
     parts = [{"quote": "它节省内存。"}, {"quote": "它运行更快。"}]
 
-    async def partial(_prompt, context):
+    async def partial(_prompt, context, **_kwargs):
         if json.loads(context).get("phase") == "coverage":
             return {
                 "coverage": [
@@ -2770,7 +2788,7 @@ def test_coverage_audit_reports_the_actual_missing_sentence(reader):
         return {"matches": [{"id": units[0]["id"], "quote": units[0]["text"], "confidence": 0.99}]}
 
     reader.reading.ask_model = partial
-    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units))
+    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units, user_id=1))
     assert matches[0]["unmatched_fragments"] == ["它运行更快。"]
 
 
@@ -2806,7 +2824,7 @@ def test_alignment_checkpoints_do_not_overwrite_concurrent_edits(reader, edit):
     async def scenario():
         reached, release = asyncio.Event(), asyncio.Event()
 
-        async def delayed(prompt, context):
+        async def delayed(prompt, context, **_kwargs):
             if any("This method needs" in c["text"] for c in json.loads(context)["candidates"]):
                 reached.set()
                 await release.wait()
@@ -2881,14 +2899,14 @@ def test_fragment_fallback_cannot_claim_two_sentences_from_one_repeated_wrong_ma
     parts = [{"quote": "它节省内存。"}, {"quote": "它运行更快。"}]
     units = pdf_index(pdf_bytes("It saves memory. It runs faster."))["units"]
 
-    async def misleading(_prompt, context):
+    async def misleading(_prompt, context, **_kwargs):
         request = json.loads(context)
         if request["selection"] == " ".join(p["quote"] for p in parts):
             return {"matches": []}
         return {"matches": [{"id": units[0]["id"], "quote": units[0]["text"], "confidence": 0.99}]}
 
     reader.reading.ask_model = misleading
-    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units))
+    matches = asyncio.run(reader.service._match_selection(" ".join(p["quote"] for p in parts), parts, units, user_id=1))
     assert len(matches) == 1
     assert matches[0]["unmatched_fragments"]
 
@@ -2974,7 +2992,7 @@ def test_server_recovers_after_browser_closes_and_service_restarts(reader):
 
     previous = reader.reading.ask_model
 
-    async def unavailable(*_):
+    async def unavailable(*_, **_kwargs):
         raise TimeoutError("provider temporarily unavailable")
 
     reader.reading.ask_model = unavailable
@@ -3048,11 +3066,11 @@ def test_recovery_budget_does_not_repeat_forever_or_block_other_documents(reader
 def test_digit_and_spelled_out_quantity_are_equivalent(reader, source, target):
     index = pdf_index(pdf_bytes(target, chinese=any("\u4e00" <= c <= "\u9fff" for c in target)))
 
-    async def answer(*_):
+    async def answer(*_, **_kwargs):
         return {"matches": [{"id": index["units"][0]["id"], "quote": target, "confidence": 0.99}]}
 
     reader.reading.ask_model = answer
-    result = asyncio.run(reader.service._match(source, index["units"]))
+    result = asyncio.run(reader.service._match(source, index["units"], user_id=1))
     assert result and result[0]["quote"] == target
 
 
@@ -3060,11 +3078,11 @@ def test_number_word_matching_does_not_round_a_different_value(reader):
     target = "Cost varies nineteen-fold (Figure 9)."
     index = pdf_index(pdf_bytes(target))
 
-    async def answer(*_):
+    async def answer(*_, **_kwargs):
         return {"matches": [{"id": index["units"][0]["id"], "quote": target, "confidence": 0.99}]}
 
     reader.reading.ask_model = answer
-    assert asyncio.run(reader.service._match("成本相差19.1倍（图9）。", index["units"])) == []
+    assert asyncio.run(reader.service._match("成本相差19.1倍（图9）。", index["units"], user_id=1)) == []
 
 
 def test_settled_document_poll_does_not_reload_each_annotation(reader):

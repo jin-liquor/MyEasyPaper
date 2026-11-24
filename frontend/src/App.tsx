@@ -12,11 +12,13 @@ import PaperSummary from "./pages/PaperSummary";
 import Layout from "./components/Layout";
 import Settings from "./pages/Settings";
 import TermMemory from "./pages/TermMemory";
+import { Fragment } from "react";
 import { ConfirmHost } from "./components/ui/confirm";
+import { useSession } from "./lib/session";
 
 const PrivateRoute = ({ children }: { children: JSX.Element }) => {
-  const token = localStorage.getItem("token");
-  return token ? children : <Navigate to="/login" />;
+  const { token, revision } = useSession();
+  return token ? <Fragment key={revision}>{children}</Fragment> : <Navigate to="/login" replace />;
 };
 
 /** Old bookmarks keep working after review and terms moved. */

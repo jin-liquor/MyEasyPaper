@@ -10,10 +10,13 @@ import os
 import signal
 import tempfile
 from pathlib import Path
+from typing import Any
 
-import httpx
+import httpx  # noqa: F401
 
 from ..core.config import LLMConfig
+from .outbound import OutboundError, request_json
+from .reasoning import ReasoningError, reasoning_payload
 
 
 class AIError(RuntimeError):
@@ -127,14 +130,35 @@ def codex_failure(stderr: str) -> AIError:
 
 
 class AIClient:
-    def __init__(self, config: LLMConfig):
+    def __init__(self, config: LLMConfig, runtime: dict[str, Any] | None = None):
         self.config = config
+        self.runtime = runtime or {}
         self._api_slots = asyncio.Semaphore(4)
         self._codex_slots = asyncio.Semaphore(config.codex.max_concurrent)
         self._cursor_slots = asyncio.Semaphore(config.cursor.max_concurrent)
 
+    @classmethod
+    def for_user(cls, user_id: int) -> AIClient:
+        """Build a client from one user's explicit selection; no global fallback."""
+        from ..api.ai_settings_routes import account_llm_config
+
+        selected = account_llm_config(user_id)
+        if selected is None:
+            raise AIError("AI_NOT_CONFIGURED：当前账户尚未配置默认模型。")
+        provider = selected["provider"]
+        model = selected["model"]
+        config = LLMConfig(
+            provider="api",
+            api_key=selected["api_key"],
+            base_url=provider["base_url"],
+            model=model["model_name"],
+        )
+        return cls(config, runtime={"user_id": user_id, "provider": provider, "model": model})
+
     @property
     def model(self) -> str:
+        if self.runtime:
+            return self.runtime["model"]["model_name"]
         if self.config.provider == "codex":
             return self.config.codex.model or "codex-default"
         if self.config.provider == "cursor":
@@ -151,6 +175,8 @@ class AIClient:
         timeout_seconds: float | None = None,
         model: str | None = None,
         bypass_slot: bool = False,
+        reasoning_level: str | None = None,
+        context_tokens: int | None = None,
     ) -> dict:
         return parse_json_object(
             await self.complete(
@@ -162,6 +188,8 @@ class AIClient:
                 timeout_seconds=timeout_seconds,
                 model=model,
                 bypass_slot=bypass_slot,
+                reasoning_level=reasoning_level,
+                context_tokens=context_tokens,
             )
         )
 
@@ -176,6 +204,8 @@ class AIClient:
         timeout_seconds: float | None = None,
         model: str | None = None,
         bypass_slot: bool = False,
+        reasoning_level: str | None = None,
+        context_tokens: int | None = None,
     ) -> str:
         if self.config.provider == "codex":
             try:
@@ -199,59 +229,139 @@ class AIClient:
         async with self._api_slots:
             try:
                 async with asyncio.timeout(timeout_seconds or 180):
-                    return await self._api(system, user, image_bytes, max_tokens, json_mode, model, timeout_seconds)
+                    if reasoning_level is None and context_tokens is None:
+                        return await self._api(system, user, image_bytes, max_tokens, json_mode, model, timeout_seconds)
+                    return await self._api(
+                        system,
+                        user,
+                        image_bytes,
+                        max_tokens,
+                        json_mode,
+                        model,
+                        timeout_seconds,
+                        reasoning_level,
+                        context_tokens,
+                    )
             except TimeoutError:
                 raise AIError("AI 接口请求超时，请稍后重试。", retryable=True) from None
 
-    async def _api(self, system, user, image_bytes, max_tokens, json_mode, model=None, timeout_seconds=None) -> str:
+    def _effective_output_tokens(self, requested: int) -> int:
+        model = self.runtime.get("model")
+        if not model:
+            return requested
+        return min(requested, int(model["max_output_tokens"]))
+
+    def _validate_runtime_input(
+        self,
+        system: str,
+        user: str,
+        image_bytes: bytes | None,
+        output_tokens: int,
+        context_tokens: int | None,
+    ) -> None:
+        model = self.runtime.get("model")
+        if not model:
+            return
+        if image_bytes and "image" not in model["input_types"]:
+            raise AIError("MODEL_INPUT_UNSUPPORTED：当前模型不支持图片输入。")
+        estimated_input = context_tokens
+        if estimated_input is None:
+            estimated_input = max(1, (len(system) + len(user) + 3) // 4)
+            if image_bytes:
+                estimated_input += 1024
+        context_window = int(model["context_window"])
+        if estimated_input + output_tokens > context_window:
+            raise AIError("CONTEXT_WINDOW_EXCEEDED：输入内容与输出预算超过模型上下文窗口。")
+
+    async def _api(
+        self,
+        system,
+        user,
+        image_bytes,
+        max_tokens,
+        json_mode,
+        model=None,
+        timeout_seconds=None,
+        reasoning_level=None,
+        context_tokens=None,
+    ) -> str:
         if not self.config.api_key or self.config.api_key == "YOUR_API_KEY":
             raise AIError("尚未配置 AI API Key，也可以设置 llm.provider 为 codex 或 cursor。")
+        output_tokens = self._effective_output_tokens(max_tokens)
+        self._validate_runtime_input(system, user, image_bytes, output_tokens, context_tokens)
+        protocol = self.runtime.get("provider", {}).get("protocol", "chat_completions")
+        try:
+            reasoning = (
+                reasoning_payload(protocol, self.runtime.get("model", {}), reasoning_level) if self.runtime else {}
+            )
+        except ReasoningError as exc:
+            raise AIError(str(exc)) from None
         content: object = user
         if image_bytes:
-            content = [
-                {"type": "text", "text": user},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64," + base64.b64encode(image_bytes).decode()},
-                },
-            ]
-        payload = {
-            "model": model or self.config.model,
-            "temperature": 0.1,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-            # Tencent TokenHub's DeepSeek models enable reasoning by default.
-            # Structured extraction needs the final content within the output
-            # budget; reasoning is not useful to the caller and can consume it.
-            "thinking": {"type": "disabled"},
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        async with httpx.AsyncClient(
-            base_url=self.config.base_url.rstrip("/") + "/",
-            timeout=httpx.Timeout(timeout_seconds or 180, connect=10),
-        ) as client:
-            try:
-                response = await client.post(
-                    "chat/completions", headers={"Authorization": f"Bearer {self.config.api_key}"}, json=payload
-                )
-                if response.status_code == 400 and json_mode:
-                    payload.pop("response_format")
-                    response = await client.post(
-                        "chat/completions", headers={"Authorization": f"Bearer {self.config.api_key}"}, json=payload
-                    )
-                response.raise_for_status()
-                result = response.json()["choices"][0]["message"]["content"]
-                if not isinstance(result, str) or not result.strip():
-                    raise AIError("AI 返回空内容。", retryable=True)
-                return result.strip()
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                raise AIError(f"AI 接口返回 HTTP {status}。", retryable=status == 429 or status >= 500) from None
-            except httpx.HTTPError:
-                raise AIError("无法连接 AI 接口，请检查网络及服务地址。", retryable=True) from None
-            except (KeyError, IndexError, ValueError, TypeError):
-                raise AIError("AI 接口返回了无法识别的响应。", retryable=True) from None
+            encoded = base64.b64encode(image_bytes).decode()
+            if protocol == "responses":
+                content = [
+                    {"type": "input_text", "text": user},
+                    {"type": "input_image", "image_url": "data:image/png;base64," + encoded},
+                ]
+            else:
+                content = [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}},
+                ]
+        if protocol == "responses":
+            payload: dict[str, Any] = {
+                "model": model or self.model,
+                "max_output_tokens": output_tokens,
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                    {
+                        "role": "user",
+                        "content": content if isinstance(content, list) else [{"type": "input_text", "text": content}],
+                    },
+                ],
+            }
+            if json_mode:
+                payload["text"] = {"format": {"type": "json_object"}}
+            endpoint = "responses"
+        else:
+            payload = {
+                "model": model or self.model,
+                "temperature": 0.1,
+                "max_tokens": output_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            endpoint = "chat/completions"
+        payload.update(reasoning)
+        try:
+            data, _ = await request_json(
+                "POST",
+                self.config.base_url.rstrip("/") + "/" + endpoint,
+                headers={"Authorization": f"Bearer {self.config.api_key}"},
+                json=payload,
+                timeout=timeout_seconds or 180,
+            )
+            if protocol == "responses":
+                result = data.get("output_text")
+                if not result:
+                    for item in data.get("output", []):
+                        for part in item.get("content", []):
+                            if part.get("type") in {"output_text", "text"}:
+                                result = part.get("text")
+                                break
+                        if result:
+                            break
+            else:
+                result = data["choices"][0]["message"]["content"]
+            if not isinstance(result, str) or not result.strip():
+                raise AIError("AI 返回空内容。", retryable=True)
+            return result.strip()
+        except OutboundError as exc:
+            raise AIError(f"{exc.code}：{str(exc)}", retryable=exc.retryable) from None
+        except (KeyError, IndexError, ValueError, TypeError):
+            raise AIError("AI 接口返回了无法识别的响应。", retryable=True) from None
 
     async def _cursor(self, system, user, image_bytes, json_mode, model=None) -> str:
         with tempfile.TemporaryDirectory(prefix="easypaper-cursor-") as temp:

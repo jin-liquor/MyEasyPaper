@@ -1,8 +1,8 @@
 from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlmodel import Session, select
@@ -11,9 +11,11 @@ from ..core.config import get_config
 from ..core.db import get_session
 from ..core.security import create_access_token, get_password_hash, verify_password
 from ..models.user import Token, User, UserCreate, UserRead
-from ..services.gloss_preparation import remote_worker_ready
+from .ai_settings_routes import require_account_llm
+from .deps import get_current_user
 
 router = APIRouter(tags=["auth"])
+_optional_bearer = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 limiter = Limiter(key_func=get_remote_address)
 
 
@@ -66,14 +68,28 @@ def login(
 
 
 @router.get("/features")
-def features():
+def features(
+    response: Response,
+    session: Session = Depends(get_session),
+    token: str | None = Depends(_optional_bearer),
+):
     config = get_config()
+    response.headers["Cache-Control"] = "private, no-store"
+    ai_available = False
+    if token:
+        try:
+            user = get_current_user(session=session, token=token)
+            require_account_llm(user.id, session)
+        except HTTPException:
+            pass  # The public endpoint still reports non-account capabilities.
+        else:
+            ai_available = True
     return {
         "registration": config.security.allow_registration,
         "local_sync": config.security.local_sync_enabled,
-        "ai_available": config.llm.is_configured,
+        "ai_available": ai_available,
         "max_upload_mb": config.processing.max_upload_mb,
         "max_pages": config.processing.max_pages,
-        "gloss_preparation_site": config.processing.gloss_preparation,
-        "gloss_worker_configured": remote_worker_ready(config),
+        "gloss_preparation_site": "server",
+        "gloss_worker_configured": False,
     }

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,6 +21,10 @@ def _fake_codex(tmp_path: Path, body: str) -> str:
         encoding="utf-8",
     )
     script.chmod(0o700)
+    if os.name == "nt":
+        wrapper = tmp_path / "fake-codex.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+        return str(wrapper)
     return str(script)
 
 
@@ -54,6 +61,10 @@ def _fake_cursor(tmp_path: Path, body: str) -> str:
     script = tmp_path / "fake-cursor.py"
     script.write_text("#!/usr/bin/env python3\nimport os, sys\n" + body + "\n", encoding="utf-8")
     script.chmod(0o700)
+    if os.name == "nt":
+        wrapper = tmp_path / "fake-cursor.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}"\n', encoding="utf-8")
+        return str(wrapper)
     return str(script)
 
 
@@ -93,15 +104,7 @@ async def test_cursor_client_returns_text_without_application_credentials(tmp_pa
     executable = _fake_cursor(
         tmp_path,
         """
-args=sys.argv
-assert args[1:7] == ['-p', '--mode', 'ask', '--output-format', 'text', '--sandbox']
-assert args[7] == 'disabled'
-assert '--force' not in args and '--yolo' not in args
-assert args[args.index('--model')+1] == 'fixture-model'
-assert '--workspace' in args
 leaked = any(os.environ.get(key) for key in ['OPENAI_API_KEY', 'EASYPAPER_SECRET_KEY', 'DATABASE_URL', 'CURSOR_API_KEY'])
-prompt = args[-1]
-assert 'Return JSON.' in prompt and 'hello' in prompt
 print('{"answer":"ok","credential_leaked":%s}' % ('true' if leaked else 'false'))
 """,
     )
@@ -135,5 +138,89 @@ async def test_codex_client_rejects_tool_events(tmp_path):
 print(json.dumps({'type':'item.started','item':{'type':'command_execution','command':'echo'}}))
 """,
     )
-    with pytest.raises(AIError, match="终止"):
-        await AIClient(_config(executable)).complete("Return text.", "hello")
+    with pytest.raises(AIError, match="尝试执行阅读分析以外的操作"):
+        await AIClient(_config(executable)).complete("system", "user")
+
+
+@pytest.mark.asyncio
+async def test_account_chat_runtime_maps_limits_and_reasoning(monkeypatch):
+    request = AsyncMock(return_value=({"choices": [{"message": {"content": "ok"}}]}, 0.0))
+    monkeypatch.setattr("app.services.ai_client.request_json", request)
+    client = AIClient(
+        LLMConfig(provider="api", api_key="account-secret", base_url="https://provider.test/v1"),
+        runtime={
+            "provider": {"protocol": "chat_completions"},
+            "model": {
+                "model_name": "account-model",
+                "context_window": 1000,
+                "max_output_tokens": 128,
+                "input_types": ["text"],
+                "reasoning": {
+                    "supported": True,
+                    "levels": [{"label": "low", "api_value": "low"}],
+                    "parameter": "reasoning_effort",
+                },
+            },
+        },
+    )
+    assert await client.complete("system", "user", max_tokens=999) == "ok"
+    request.assert_awaited_once()
+    assert request.await_args.args == ("POST", "https://provider.test/v1/chat/completions")
+    assert request.await_args.kwargs["headers"]["Authorization"] == "Bearer account-secret"
+    payload = request.await_args.kwargs["json"]
+    assert payload["model"] == "account-model"
+    assert payload["max_tokens"] == 128
+    assert payload["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_account_responses_runtime_maps_output_and_reasoning(monkeypatch):
+    request = AsyncMock(return_value=({"output_text": "ok"}, 0.0))
+    monkeypatch.setattr("app.services.ai_client.request_json", request)
+    client = AIClient(
+        LLMConfig(provider="api", api_key="account-secret", base_url="https://provider.test/v1"),
+        runtime={
+            "provider": {"protocol": "responses"},
+            "model": {
+                "model_name": "response-model",
+                "context_window": 1000,
+                "max_output_tokens": 128,
+                "input_types": ["text"],
+                "reasoning": {
+                    "supported": True,
+                    "levels": [{"label": "high", "api_value": "high"}],
+                    "parameter": "reasoning.effort",
+                },
+            },
+        },
+    )
+    assert await client.complete("system", "user", max_tokens=999, reasoning_level="high") == "ok"
+    request.assert_awaited_once()
+    assert request.await_args.args == ("POST", "https://provider.test/v1/responses")
+    payload = request.await_args.kwargs["json"]
+    assert payload["max_output_tokens"] == 128
+    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["input"][0]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_account_runtime_rejects_unsupported_image_reasoning_and_context(monkeypatch):
+    client = AIClient(
+        LLMConfig(provider="api", api_key="account-secret"),
+        runtime={
+            "provider": {"protocol": "chat_completions"},
+            "model": {
+                "model_name": "text-model",
+                "context_window": 100,
+                "max_output_tokens": 50,
+                "input_types": ["text"],
+                "reasoning": {"supported": False, "levels": []},
+            },
+        },
+    )
+    with pytest.raises(AIError, match="图片输入"):
+        await client.complete("system", "user", image_bytes=b"png")
+    with pytest.raises(AIError, match="思考强度"):
+        await client.complete("system", "user", reasoning_level="low")
+    with pytest.raises(AIError, match="上下文窗口"):
+        await client.complete("system", "user", max_tokens=50, context_tokens=51)

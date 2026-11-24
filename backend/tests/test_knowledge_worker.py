@@ -134,3 +134,19 @@ def test_worker_claim_package_and_complete(engine, worker_env, tmp_path):
 def test_worker_requires_token(worker_env):
     response = worker_env.client.post("/api/knowledge-worker/jobs/claim", json={"worker_label": "x"})
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("claim_first", [False, True])
+def test_server_only_startup_retires_knowledge_jobs(engine, worker_env, tmp_path, claim_first):
+    _seed_job(engine, worker_env, tmp_path)
+    if claim_first:
+        assert worker_env.service.claim_next(worker_label="fixture")["claim_token"]
+
+    worker_env.service.recover_after_restart(server_only=True)
+    worker_env.service.recover_after_restart(server_only=True)
+
+    with Session(engine) as session:
+        job = session.get(KnowledgeWorkerJob, "pk_test01:knowledge")
+        assert job.status == "failed"
+        assert job.claim_token is None and job.claimed_until is None
+        assert session.get(PaperKnowledge, job.paper_id).extraction_status == "error"

@@ -24,7 +24,6 @@ def test_real_pdf_pages_report_progress_and_use_configured_workers(engine, tmp_p
     from pdf2zh.cache import TranslationCache
     from pdf2zh.config import ConfigManager
     from pdf2zh.doclayout import DocLayoutModel
-    from pdf2zh.translator import OpenAIlikedTranslator
 
     config = AppConfig(
         llm={"api_key": "fixture", "base_url": "https://example.invalid/v1"},
@@ -66,7 +65,38 @@ def test_real_pdf_pages_report_progress_and_use_configured_workers(engine, tmp_p
             concurrent -= 1
         return text
 
-    monkeypatch.setattr(OpenAIlikedTranslator, "do_translate", translate)
+    fake_ai = SimpleNamespace(
+        config=config.llm,
+        model=config.llm.model,
+        runtime={
+            "user_id": 1,
+            "provider": {
+                "id": "fixture-provider",
+                "protocol": "chat_completions",
+                "base_url": config.llm.base_url,
+            },
+            "model": {
+                "id": "fixture-model",
+                "model_name": config.llm.model,
+                "max_output_tokens": 1024,
+            },
+        },
+    )
+
+    async def complete(_system, prompt):
+        if "Source Text:" in prompt:
+            text = prompt.split("Source Text:", 1)[1].split("\n\nSimplified Text:", 1)[0].strip()
+        elif "Source text:\n" in prompt:
+            text = prompt.split("Source text:\n", 1)[1]
+        else:
+            text = prompt.rsplit("\n\n", 1)[-1]
+        return await asyncio.to_thread(translate, None, text)
+
+    fake_ai.complete = complete
+    monkeypatch.setattr(
+        "app.services.document_processor.AIClient.for_user",
+        staticmethod(lambda _user_id: fake_ai),
+    )
 
     def predict(*_args, **_kwargs):
         page_states.append(manager.get_task(task.task_id).progress)
@@ -88,7 +118,7 @@ def test_real_pdf_pages_report_progress_and_use_configured_workers(engine, tmp_p
         source = pdf.tobytes()
 
     processor = DocumentProcessor(config, manager, ai_client=SimpleNamespace())
-    asyncio.run(processor.process(task.task_id, source, "fixture.pdf", mode=mode))
+    asyncio.run(processor.process(task.task_id, source, "fixture.pdf", mode=mode, user_id=1))
     result = manager.get_task(task.task_id)
     assert result.status == TaskStatus.COMPLETED, result.error
     assert result.percent == 100

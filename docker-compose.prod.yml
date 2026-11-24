@@ -41,12 +41,15 @@ services:
       APP_ENV: production
       EASYPAPER_SECRET_KEY: ${EASYPAPER_SECRET_KEY:?run scripts/prepare_server.py}
       DATABASE_URL: postgresql://easypaper:${POSTGRES_PASSWORD}@db:5432/easypaper
-      # Accounts and saved papers remain accessible before AI is configured.
+      # Server-only durable encryption keys; production startup validates the selection.
+      EASYPAPER_CREDENTIAL_ENCRYPTION_KEYS: ${EASYPAPER_CREDENTIAL_ENCRYPTION_KEYS:-}
+      EASYPAPER_CREDENTIAL_ENCRYPTION_ACTIVE_VERSION: ${EASYPAPER_CREDENTIAL_ENCRYPTION_ACTIVE_VERSION:-}
+      EASYPAPER_CREDENTIAL_ENCRYPTION_KEY: ${EASYPAPER_CREDENTIAL_ENCRYPTION_KEY:-}
+      # Legacy system configuration is not used as an account credential.
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
-      # Keep outbound model calls on the server's private proxy when one is
-      # configured. Internal health and database traffic must bypass it.
+      # Downloads and legacy clients may use the proxy; account AI uses pinned direct connections.
       EASYPAPER_DOWNLOAD_PROXY: ${EASYPAPER_DOWNLOAD_PROXY:-}
       HTTP_PROXY: ${EASYPAPER_DOWNLOAD_PROXY:-}
       HTTPS_PROXY: ${EASYPAPER_DOWNLOAD_PROXY:-}

@@ -9,6 +9,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
+from ..services.credential_store import CredentialStoreError, load_keyring
+
 GlossPreparationSite = Literal["server", "remote_worker", "user_choice"]
 
 logger = logging.getLogger(__name__)
@@ -164,8 +166,22 @@ def validate_security(config: AppConfig, app_env: str) -> None:
             raise RuntimeError(f"Refusing to start in production: {message}")
         logger.warning("SECURITY WARNING: %s", message)
 
-    if config.llm.provider == "api" and (not config.llm.api_key or config.llm.api_key == "YOUR_API_KEY"):
-        logger.warning("LLM api_key is not configured. LLM features will fail.")
+    if (
+        not is_prod
+        and config.llm.provider == "api"
+        and (not config.llm.api_key or config.llm.api_key == "YOUR_API_KEY")
+    ):
+        logger.warning("Legacy LLM API key is not configured; account AI uses each account's settings.")
+
+    try:
+        load_keyring()
+    except CredentialStoreError as exc:
+        if is_prod:
+            raise RuntimeError(
+                "Refusing to start in production: credential keyring is misconfigured "
+                "(set EASYPAPER_CREDENTIAL_ENCRYPTION_KEYS and EASYPAPER_CREDENTIAL_ENCRYPTION_ACTIVE_VERSION)."
+            ) from None
+        logger.warning("CREDENTIAL KEYRING WARNING: %s", exc.code)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:

@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import api from "@/lib/api";
 import { getApiErrorMessage } from "@/lib/errors";
 import { useFeatures } from "@/lib/features";
+import { getSession, isCurrentSession, startSession } from "@/lib/session";
 
 export default function Login() {
   const features = useFeatures();
@@ -19,14 +20,15 @@ export default function Login() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    const loginSession = getSession();
     try {
       const formData = new FormData();
       formData.append("username", email);
       formData.append("password", password);
 
       const response = await api.post("/api/auth/login", formData);
-      localStorage.setItem("token", response.data.access_token);
-      localStorage.setItem("email", email.trim().toLowerCase());
+      if (!isCurrentSession(loginSession)) return;
+      startSession(response.data.access_token, email.trim().toLowerCase());
       navigate("/dashboard");
     } catch (error: unknown) {
       const message = getApiErrorMessage(error, "登录失败，请检查邮箱和密码。");

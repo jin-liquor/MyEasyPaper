@@ -121,6 +121,14 @@ class KnowledgeExtractor:
         self.model = self.ai.model
         self.max_concurrent = max_concurrent
 
+    @staticmethod
+    def _ai_for_scope(user_id: int | None, fallback: AIClient | None = None) -> AIClient:
+        if user_id is not None:
+            return AIClient.for_user(user_id)
+        if fallback is None:
+            raise AIError("AI_NOT_CONFIGURED：系统任务未提供 AI 客户端。")
+        return fallback
+
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
@@ -135,6 +143,7 @@ class KnowledgeExtractor:
         """完整提取流水线：PDF → 结构化知识 JSON → 存入数据库。"""
         if paper_id is None:
             paper_id = _gen_id("pk")
+        ai_client = self._ai_for_scope(user_id, self.ai)
 
         with Session(engine) as session:
             paper = session.get(PaperKnowledge, paper_id)
@@ -144,14 +153,14 @@ class KnowledgeExtractor:
                     task_id=task_id,
                     user_id=user_id,
                     extraction_status="extracting",
-                    extraction_model=self.model,
+                    extraction_model=ai_client.model,
                 )
                 session.add(paper)
             else:
                 # merge() on a sparse model would wipe title/metadata set when the
                 # reader workspace first registered this paper.
                 paper.extraction_status = "extracting"
-                paper.extraction_model = self.model
+                paper.extraction_model = ai_client.model
                 paper.extraction_error = None
                 paper.updated_at = datetime.utcnow()
                 session.add(paper)
@@ -164,12 +173,12 @@ class KnowledgeExtractor:
             logger.info("知识提取完成: %s - %s", paper_id, paper.title)
             return paper
         except Exception as exc:
-            logger.exception("知识提取失败: %s", exc)
+            logger.error("知识提取失败: exception_type=%s", type(exc).__name__)
             with Session(engine) as session:
                 failed = session.get(PaperKnowledge, paper_id)
                 if failed:
                     failed.extraction_status = "error"
-                    failed.extraction_error = str(exc)
+                    failed.extraction_error = "知识提取失败，请重试。"
                     failed.updated_at = datetime.utcnow()
                     session.add(failed)
                     session.commit()
@@ -280,11 +289,11 @@ class KnowledgeExtractor:
 
         # 2. 提取 metadata（前2页）
         first_pages = "\n\n".join(pages_text[:2])
-        metadata = await self._llm_call(METADATA_PROMPT, first_pages, "metadata")
+        metadata = await self._llm_call(METADATA_PROMPT, first_pages, "metadata", user_id=user_id)
         stage += 1
 
         # 3. 识别 section 结构
-        sections_data = await self._llm_call(SECTIONS_PROMPT, full_text[:20000], "sections")
+        sections_data = await self._llm_call(SECTIONS_PROMPT, full_text[:20000], "sections", user_id=user_id)
         stage += 1
         sections = sections_data.get("sections", [])
         if reading_document and reading_document.get("sections"):
@@ -318,12 +327,12 @@ class KnowledgeExtractor:
 
         async def extract_chunk(chunk_text: str):
             async with semaphore:
-                return await self._llm_call(ENTITY_RELATIONSHIP_PROMPT, chunk_text, "entities")
+                return await self._llm_call(ENTITY_RELATIONSHIP_PROMPT, chunk_text, "entities", user_id=user_id)
 
         tasks = [extract_chunk(chunk) for chunk in chunks]
 
         if not tasks:
-            result = await self._llm_call(ENTITY_RELATIONSHIP_PROMPT, full_text[:6000], "entities")
+            result = await self._llm_call(ENTITY_RELATIONSHIP_PROMPT, full_text[:6000], "entities", user_id=user_id)
             all_entities.extend(result.get("entities", []))
             all_relationships.extend(result.get("relationships", []))
             stage += 1
@@ -359,7 +368,7 @@ class KnowledgeExtractor:
         # 5. 提取 findings + methods + datasets
         stage += 1
         await _report(stage, progress_total)
-        findings_data = await self._llm_call(FINDINGS_PROMPT, full_text[:20000], "findings")
+        findings_data = await self._llm_call(FINDINGS_PROMPT, full_text[:20000], "findings", user_id=user_id)
         findings = findings_data.get("findings", [])
         for _i, f in enumerate(findings):
             f["id"] = _gen_id("find")
@@ -373,7 +382,7 @@ class KnowledgeExtractor:
         )
         stage += 1
         await _report(stage, progress_total)
-        flashcards_data = await self._llm_call(FLASHCARD_PROMPT, flashcard_context, "flashcards")
+        flashcards_data = await self._llm_call(FLASHCARD_PROMPT, flashcard_context, "flashcards", user_id=user_id)
         stage += 1
         await _report(stage, progress_total)
         flashcards = flashcards_data.get("flashcards", [])
@@ -399,7 +408,7 @@ class KnowledgeExtractor:
             "flashcards": flashcards,
             "annotations": [],
             "extracted_at": datetime.utcnow().isoformat(),
-            "extraction_model": self.model,
+            "extraction_model": self._ai_for_scope(user_id, self.ai).model,
         }
 
         if persist_indexes:
@@ -429,28 +438,39 @@ class KnowledgeExtractor:
     # LLM 调用（带重试）
     # ------------------------------------------------------------------
 
-    async def _llm_call(self, system_prompt: str, user_content: str, label: str) -> dict:
+    async def _llm_call(self, system_prompt: str, user_content: str, label: str, *, user_id: int | None = None) -> dict:
         """单次 LLM API 调用，带重试和 JSON 解析。"""
         max_retries = 3
         base_delay = 2
+        ai_client = self._ai_for_scope(user_id, self.ai)
 
         for attempt in range(max_retries):
             try:
-                return await self._do_llm_call(system_prompt, user_content)
+                return await self._do_llm_call(system_prompt, user_content, ai_client)
             except Exception as exc:
-                if isinstance(exc, AIError) and (self.ai.config.uses_cli or not exc.retryable):
+                if isinstance(exc, AIError) and (ai_client.config.uses_cli or not exc.retryable):
                     raise
                 if attempt == max_retries - 1:
-                    logger.error("LLM call [%s] failed after %d retries: %s", label, max_retries, exc)
+                    logger.error(
+                        "LLM call [%s] failed after %d retries: exception_type=%s",
+                        label,
+                        max_retries,
+                        type(exc).__name__,
+                    )
                     return {}
                 delay = base_delay * (2**attempt)
-                logger.warning("LLM call [%s] error: %s, retrying in %ds...", label, exc, delay)
+                logger.warning(
+                    "LLM call [%s] error: exception_type=%s, retrying in %ds...",
+                    label,
+                    type(exc).__name__,
+                    delay,
+                )
                 await asyncio.sleep(delay)
         return {}
 
-    async def _do_llm_call(self, system_prompt: str, user_content: str) -> dict:
+    async def _do_llm_call(self, system_prompt: str, user_content: str, ai_client: AIClient) -> dict:
         """执行 LLM API 调用并解析 JSON 响应。"""
-        return await self.ai.complete_json(system_prompt, user_content, max_tokens=4096)
+        return await ai_client.complete_json(system_prompt, user_content, max_tokens=4096)
 
     # ------------------------------------------------------------------
     # 实体去重

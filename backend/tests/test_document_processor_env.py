@@ -7,26 +7,24 @@ from app.services.document_processor import DocumentProcessor
 from app.services.task_manager import TaskManager
 
 
-def test_pdf2zh_env_configured_from_config(monkeypatch):
-    # pdf2zh reads its LLM credentials from process-global env vars. Constructing the
-    # processor must publish them once, so translations don't need to lock/swap the
-    # env per call (which previously serialized all concurrent translations).
-    monkeypatch.delenv("OPENAILIKED_API_KEY", raising=False)
+def test_pdf2zh_credentials_are_not_published_to_process_environment(monkeypatch):
+    for key in ("OPENAILIKED_API_KEY", "OPENAILIKED_BASE_URL", "OPENAILIKED_MODEL"):
+        monkeypatch.delenv(key, raising=False)
 
     DocumentProcessor(
         config=AppConfig(
             llm={
-                "api_key": "new-key",
-                "base_url": "new-url",
-                "model": "new-model",
+                "api_key": "fixture-secret",
+                "base_url": "https://provider.example/v1",
+                "model": "fixture-model",
             }
         ),
         task_manager=TaskManager(),
     )
 
-    assert os.environ["OPENAILIKED_BASE_URL"] == "new-url"
-    assert os.environ["OPENAILIKED_API_KEY"] == "new-key"
-    assert os.environ["OPENAILIKED_MODEL"] == "new-model"
+    assert "OPENAILIKED_API_KEY" not in os.environ
+    assert "OPENAILIKED_BASE_URL" not in os.environ
+    assert "OPENAILIKED_MODEL" not in os.environ
 
 
 def test_processor_has_no_global_translation_lock():

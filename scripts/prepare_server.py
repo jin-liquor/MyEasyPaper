@@ -14,7 +14,7 @@ def prepare(root: Path, domain: str, *, behind_proxy: bool = False):
         address = ipaddress.IPv4Address(domain)
     except ValueError:
         if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
-            raise ValueError("请输入域名，例如 papers.example.com，不包含协议或路径")
+            raise ValueError("请输入域名，例如 papers.example.com，不包含协议或路径") from None
     else:
         if not address.is_global or not behind_proxy:
             raise ValueError("公网 IPv4 访问需要 --behind-proxy，并在现有代理上配置覆盖该 IP 的公共可信 HTTPS 证书")
@@ -24,9 +24,8 @@ DOMAIN={domain}
 BIND_IP={"127.0.0.1" if behind_proxy else "0.0.0.0"}
 POSTGRES_PASSWORD={secrets.token_hex(32)}
 EASYPAPER_SECRET_KEY={secrets.token_hex(32)}
-LLM_API_KEY=
-LLM_BASE_URL=
-LLM_MODEL=
+EASYPAPER_CREDENTIAL_ENCRYPTION_KEYS='{{"v1":"{secrets.token_urlsafe(32)}="}}'
+EASYPAPER_CREDENTIAL_ENCRYPTION_ACTIVE_VERSION=v1
 BACKEND_MEMORY=4g
 BACKEND_CPUS=2
 """
@@ -45,6 +44,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         result = prepare(Path(__file__).resolve().parents[1], args.domain, behind_proxy=args.behind_proxy)
-        print(f"已生成 {result}（权限 600）。填入 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 后即可部署。")
+        print(f"已生成 {result}（权限 600）。部署后请各账户在网页设置中配置自己的 AI 供应商。")
     except (ValueError, FileExistsError) as error:
         parser.error(str(error))

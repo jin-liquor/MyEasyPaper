@@ -91,7 +91,25 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="Poll knowledge-worker jobs (default on; disable for gloss-only)",
     )
+    rotate = sub.add_parser("rewrap-ai-credentials", help="Rewrap stored AI credentials with the active key")
+    rotate.add_argument("--batch-size", type=int, default=100)
+    rotate.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "rewrap-ai-credentials":
+        if args.batch_size < 1:
+            parser.error("--batch-size must be positive")
+        try:
+            from .core.db import engine
+            from .models.knowledge import UserSetting
+            from .services.credential_store import rewrap_user_settings
+
+            with Session(engine) as session:
+                counts = rewrap_user_settings(session, UserSetting, batch_size=args.batch_size, dry_run=args.dry_run)
+        except Exception:
+            print("AI credential rotation failed. Check database and server keyring configuration.", file=sys.stderr)
+            return 1
+        print(" ".join(f"{name}={count}" for name, count in counts.items()))
+        return int(bool(counts["failed"] or counts["conflicts"]))
     from .core.db import engine, init_db
 
     init_db()

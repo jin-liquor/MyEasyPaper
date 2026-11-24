@@ -168,7 +168,7 @@ class HighlightService:
             result_bytes = doc.tobytes()
             return result_bytes, stats
         except Exception as exc:
-            logger.error("Highlight processing failed: %s", exc)
+            logger.error("Highlight processing failed: exception_type=%s", type(exc).__name__)
             return pdf_bytes, HighlightStats()
         finally:
             doc.close()
@@ -183,7 +183,7 @@ class HighlightService:
             result_bytes = doc.tobytes()
             return result_bytes, stats, applied
         except Exception as exc:
-            logger.error("Highlight processing failed: %s", exc)
+            logger.error("Highlight processing failed: exception_type=%s", type(exc).__name__)
             return pdf_bytes, HighlightStats(), []
         finally:
             doc.close()
@@ -385,10 +385,14 @@ class HighlightService:
                 if isinstance(exc, AIError) and (self.ai.config.uses_cli or not exc.retryable):
                     raise
                 if attempt == max_retries - 1:
-                    logger.error("Candidate classification failed: %s", exc)
+                    logger.error("Candidate classification failed: exception_type=%s", type(exc).__name__)
                     return []
                 delay = base_delay * (2**attempt)
-                logger.warning("Candidate classification error: %s, retrying in %ds...", exc, delay)
+                logger.warning(
+                    "Candidate classification error: exception_type=%s, retrying in %ds",
+                    type(exc).__name__,
+                    delay,
+                )
                 await asyncio.sleep(delay)
         return []
 

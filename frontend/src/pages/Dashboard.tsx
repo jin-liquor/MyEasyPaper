@@ -306,13 +306,20 @@ const Dashboard = () => {
   }, [fetchKnowledge, fetchTasks]);
 
   // The command palette opens the import dialog with ?import=1.
-  useEffect(() => {
-    if (searchParams.get("import") !== "1") return;
-    setImportOpen(true);
+  const importRequested = searchParams.get("import") === "1";
+  const dismissImportRequest = useCallback(() => {
     const next = new URLSearchParams(searchParams);
     next.delete("import");
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
+  useEffect(() => {
+    if (importRequested && features.loaded && !features.ai_available) dismissImportRequest();
+  }, [importRequested, features.loaded, features.ai_available, dismissImportRequest]);
+
+  const onImportOpenChange = (open: boolean) => {
+    setImportOpen(open);
+    if (!open && importRequested) dismissImportRequest();
+  };
 
   const onImported = (result: ImportResult, name: string) => {
     void fetchTasks();
@@ -415,7 +422,7 @@ const Dashboard = () => {
           AI 服务尚未就绪，暂时不能导入或生成新版本。已保存的论文仍可阅读，请联系管理员。
         </p>
       )}
-      <ImportDialog open={importOpen} onOpenChange={setImportOpen} features={features} onImported={onImported} />
+      <ImportDialog open={(importOpen || importRequested) && features.ai_available} onOpenChange={onImportOpenChange} features={features} onImported={onImported} />
       {loading ? (
         <ListSkeleton rows={3} label="正在加载论文…" />
       ) : loadError && tasks.length === 0 ? (

@@ -146,3 +146,24 @@ def test_worker_claim_package_and_complete(engine, worker_env, tmp_path):
 def test_worker_requires_token(worker_env):
     response = worker_env.client.post("/api/gloss-worker/jobs/claim", json={"worker_label": "x"})
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("claim_first", [False, True])
+def test_server_only_startup_retires_gloss_jobs(engine, worker_env, tmp_path, claim_first):
+    _seed_job(engine, worker_env, tmp_path)
+    if claim_first:
+        assert worker_env.service.claim_next(worker_label="fixture")["claim_token"]
+    with Session(engine) as session:
+        session.add(ReaderGloss(document_id="doc123", spans_json='[{"id":"saved"}]'))
+        session.commit()
+
+    worker_env.service.recover_after_restart(server_only=True)
+    worker_env.service.recover_after_restart(server_only=True)
+
+    with Session(engine) as session:
+        job = session.get(GlossWorkerJob, "doc123:gloss")
+        assert job.status == "failed"
+        assert job.claim_token is None and job.claimed_until is None
+        assert session.get(ReaderBuild, job.id).status == "error"
+        assert session.get(Task, job.task_id).status == TaskStatus.ERROR
+        assert json.loads(session.get(ReaderGloss, "doc123").spans_json) == [{"id": "saved"}]

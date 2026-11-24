@@ -15,10 +15,9 @@ from sqlmodel import Session
 
 from .api.agent_deps import MCPAuthMiddleware
 from .api.agent_routes import create_agent_router
+from .api.ai_settings_routes import ROUTER as ai_settings_router
 from .api.auth import router as auth_router
-from .api.gloss_worker_routes import create_gloss_worker_router
 from .api.knowledge_routes import create_knowledge_router
-from .api.knowledge_worker_routes import create_knowledge_worker_router
 from .api.reader_routes import create_reader_router
 from .api.reading_routes import create_reading_router
 from .api.routes import create_router
@@ -121,6 +120,7 @@ if not config.agent.enabled:
     app.add_middleware(ServerGuard, config=config, engine=engine)
 
 app.include_router(auth_router, prefix="/api/auth")
+app.include_router(ai_settings_router)
 app.include_router(settings_router)
 app.include_router(
     create_agent_router(
@@ -129,12 +129,8 @@ app.include_router(
         artifact_service=artifact_service,
     )
 )
-app.include_router(create_router(task_manager, processor, reading_service, job_queue, gloss_worker_service))
-app.include_router(create_gloss_worker_router(gloss_worker_service))
-app.include_router(create_knowledge_worker_router(knowledge_worker_service))
-app.include_router(
-    create_knowledge_router(knowledge_extractor, job_queue, knowledge_worker_service=knowledge_worker_service)
-)
+app.include_router(create_router(task_manager, processor, reading_service, job_queue))
+app.include_router(create_knowledge_router(knowledge_extractor, job_queue))
 app.include_router(create_reading_router(reading_service))
 app.include_router(create_term_router())
 app.include_router(create_reader_router(reading_service))
@@ -160,8 +156,8 @@ async def on_startup() -> None:
 
     from .models.reading import ReaderBuild
 
-    gloss_worker_service.recover_after_restart()
-    knowledge_worker_service.recover_after_restart()
+    gloss_worker_service.recover_after_restart(server_only=True)
+    knowledge_worker_service.recover_after_restart(server_only=True)
     with Session(engine) as session:
         for build in session.exec(select(ReaderBuild).where(ReaderBuild.status == "running")).all():
             if build.kind == "gloss":

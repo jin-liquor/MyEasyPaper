@@ -17,13 +17,14 @@ from sqlmodel import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse
 
+from ..api.ai_settings_routes import require_account_llm
 from ..api.deps import get_current_user
 from ..models.usage import DailyUsage
 
 AI_OPERATION = re.compile(
     r"/api/(?:upload|upload-url|summary/[^/]+|tasks/[^/]+/(?:retry|title-translation)|knowledge/extract/[^/]+"
-    r"|reading/[^/]+/(?:ask|ask-image|summary|blocks/[^/]+/(?:aid|explain))"
-    r"|reader/documents/[^/]+/(?:versions/[^/]+|annotations/[^/]+/align))/?$"
+    r"|reading/[^/]+/(?:ask|ask-image|summary|blocks/[^/]+/(?:aid|explain)|pages/[^/]+/aid)"
+    r"|reader/documents/[^/]+/(?:versions/[^/]+|annotations/[^/]+/align))$"
 )
 
 
@@ -70,8 +71,8 @@ class ServerGuard:
     def authenticate(self, token, method, path):
         with Session(self.engine) as session:
             user = get_current_user(session=session, token=token)
-            if method == "POST" and AI_OPERATION.fullmatch(path) and not self.config.llm.is_configured:
-                raise HTTPException(503, "AI 服务尚未配置，请联系管理员；已有论文仍可阅读。")
+            if method == "POST" and AI_OPERATION.fullmatch(path):
+                require_account_llm(user.id, session)
             # Read/save-state/delete stay usable after the expensive-operation
             # allowance is exhausted. Failed admitted attempts still cost a unit.
             # Preferences and short TTS reads are authenticated state/read
@@ -93,6 +94,11 @@ class ServerGuard:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path, method = scope["path"], scope["method"]
+        # Admit the canonical AI endpoint once rather than charging both the
+        # automatic slash redirect and the redirected request.
+        if method == "POST" and path.endswith("/") and AI_OPERATION.fullmatch(path[:-1]):
+            path = path[:-1]
+            scope = {**scope, "path": path}
         headers = {k.lower(): v for k, v in scope["headers"]}
 
         async def reject(code, detail):

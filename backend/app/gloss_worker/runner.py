@@ -1,20 +1,15 @@
-"""Poll the server and run gloss preparation locally with the configured AI provider."""
+"""Legacy polling client that refuses account AI workloads."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import tempfile
-import zipfile
-from pathlib import Path
 
 import httpx
 
-from ..core.config import get_config
-from ..services.ai_client import AIClient, AIError
-from ..services.gloss import GLOSS_CONCURRENCY, prepare_gloss
+from ..services.ai_client import AIError
+from ..services.gloss import GLOSS_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +29,6 @@ class GlossWorkerRunner:
         self.token = token.strip()
         self.worker_label = worker_label[:120]
         self.poll_seconds = max(1.0, poll_seconds)
-        self.ai = AIClient(get_config().llm)
         self._headers = {"Authorization": f"Bearer {self.token}"}
 
     async def run_forever(self) -> None:
@@ -46,7 +40,7 @@ class GlossWorkerRunner:
                 try:
                     handled = await self._poll_once(client)
                 except httpx.HTTPError as exc:
-                    logger.warning("Gloss worker request failed: %s", exc)
+                    logger.warning("Gloss worker request failed: exception_type=%s", type(exc).__name__)
                     handled = False
                 if not handled:
                     await asyncio.sleep(self.poll_seconds)
@@ -66,78 +60,15 @@ class GlossWorkerRunner:
         try:
             await self._process_job(client, claim_token)
         except AIError as exc:
-            await self._fail(client, claim_token, str(exc))
+            logger.error("Gloss worker AI job failed: exception_type=%s", type(exc).__name__)
+            await self._fail(client, claim_token, "本地点读准备失败，请重试。")
         except Exception as exc:
-            logger.exception("Gloss worker job failed")
-            await self._fail(client, claim_token, f"本地点读准备失败：{exc}")
+            logger.error("Gloss worker job failed: exception_type=%s", type(exc).__name__)
+            await self._fail(client, claim_token, "本地点读准备失败，请重试。")
         return True
 
     async def _process_job(self, client: httpx.AsyncClient, claim_token: str) -> None:
-        package = await client.get(
-            f"/api/gloss-worker/jobs/{claim_token}/package",
-            headers=self._headers,
-        )
-        package.raise_for_status()
-        with tempfile.TemporaryDirectory(prefix="easypaper-gloss-") as temp:
-            root = Path(temp)
-            archive_path = root / "job.zip"
-            archive_path.write_bytes(package.content)
-            with zipfile.ZipFile(archive_path) as archive:
-                manifest = json.loads(archive.read("manifest.json"))
-                units = json.loads(archive.read("index.json"))["units"]
-                resume = json.loads(archive.read("resume_spans.json"))
-                archive.extract("original.pdf", root)
-            pdf_path = root / "original.pdf"
-            digest = manifest.get("original_pdf_sha256")
-            if digest:
-                import hashlib
-
-                actual = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-                if actual != digest:
-                    raise RuntimeError("PDF 校验失败，拒绝处理。")
-            covered = {span.get("unit_id") for span in resume if isinstance(span, dict) and span.get("unit_id")}
-            collected: list = list(resume) if isinstance(resume, list) else []
-
-            async def on_progress(done, total):
-                await client.post(
-                    f"/api/gloss-worker/jobs/{claim_token}/progress",
-                    headers=self._headers,
-                    json={"done": done, "total": total},
-                )
-                await client.post(
-                    f"/api/gloss-worker/jobs/{claim_token}/heartbeat",
-                    headers=self._headers,
-                )
-
-            async def on_batch(produced):
-                collected.extend(produced)
-                checkpoint = await client.post(
-                    f"/api/gloss-worker/jobs/{claim_token}/checkpoint",
-                    headers=self._headers,
-                    json={"spans": produced},
-                )
-                checkpoint.raise_for_status()
-
-            spans = await prepare_gloss(
-                self.ai,
-                units,
-                on_progress,
-                on_batch=on_batch,
-                skip_ids=covered,
-                concurrency=_concurrency(),
-            )
-            _ = spans
-            complete = await client.post(
-                f"/api/gloss-worker/jobs/{claim_token}/complete",
-                headers=self._headers,
-                json={"spans": collected},
-            )
-            complete.raise_for_status()
-            logger.info(
-                "Uploaded gloss result task=%s spans=%d",
-                manifest.get("task_id"),
-                len(collected),
-            )
+        raise AIError("账户 AI 任务须在服务器执行。")
 
     async def _fail(self, client: httpx.AsyncClient, claim_token: str, message: str) -> None:
         try:
@@ -146,15 +77,13 @@ class GlossWorkerRunner:
                 headers=self._headers,
                 json={"message": message[:500]},
             )
-        except httpx.HTTPError:
-            logger.exception("Failed to report gloss worker failure")
+        except httpx.HTTPError as exc:
+            logger.error("Failed to report gloss worker failure: exception_type=%s", type(exc).__name__)
 
 
 def run_worker(*, base_url: str, token: str, worker_label: str, poll_seconds: float) -> int:
     if not token.strip():
         raise ValueError("GLOSS_WORKER_TOKEN 或 --token 不能为空")
-    if not get_config().llm.is_configured:
-        raise ValueError("本地 AI 未配置，无法在本机准备点读。请配置 API Key 或 Cursor/Codex。")
     runner = GlossWorkerRunner(
         base_url=base_url,
         token=token,

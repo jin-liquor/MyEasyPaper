@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import tempfile
 from pathlib import Path
 from string import Template
@@ -50,10 +49,21 @@ class DocumentProcessor:
         self.config = config
         self.task_manager = task_manager
         self.ai = ai_client or AIClient(config.llm)
-        self._configure_pdf2zh_env()
+
+    @staticmethod
+    def _ai_for_scope(user_id: int | None, fallback: AIClient) -> AIClient:
+        if user_id is None:
+            raise DocumentProcessingError("用户任务缺少账户上下文，已拒绝执行。")
+        return AIClient.for_user(user_id)
 
     async def process(
-        self, task_id: str, file_bytes: bytes, filename: str, mode: str = "translate", highlight: bool = False
+        self,
+        task_id: str,
+        file_bytes: bytes,
+        filename: str,
+        mode: str = "translate",
+        highlight: bool = False,
+        user_id: int | None = None,
     ) -> None:
         """使用 pdf2zh 处理 PDF 文档"""
 
@@ -66,10 +76,10 @@ class DocumentProcessor:
             self.task_manager.update_progress(task_id, TaskStatus.PARSING, 10, "正在准备翻译...")
 
         try:
+            ai_client = self._ai_for_scope(user_id, self.ai)
             translation_records = []
-            # 在线程中运行 pdf2zh（同步库）。pdf2zh 的 LLM 配置通过进程级环境变量传入，
-            # 已在 __init__ 中设置好，且对所有任务一致，因此无需在每次翻译时加锁切换环境
-            # （旧实现会因此把所有并发翻译串行化）。多个翻译可在此并发执行。
+            # 在线程中运行 pdf2zh（同步库）。用户任务使用请求级账户 AIClient，
+            # 凭据不会写入进程环境，因此不同账户的并发翻译不会共享认证状态。
             result = await asyncio.to_thread(
                 self._translate_with_pdf2zh,
                 file_bytes,
@@ -78,6 +88,7 @@ class DocumentProcessor:
                 mode,
                 asyncio.get_running_loop(),
                 translation_records,
+                ai_client=ai_client,
             )
 
             pdf_bytes, output_filename, dual_pdf_bytes = result
@@ -90,7 +101,7 @@ class DocumentProcessor:
                         api_key=self.config.llm.api_key,
                         model=self.config.llm.model,
                         base_url=self.config.llm.base_url,
-                        ai_client=self.ai,
+                        ai_client=ai_client,
                     )
                     async with highlight_service:
                         pdf_bytes, stats, highlight_sentences = await highlight_service.highlight_pdf_with_metadata(
@@ -104,7 +115,10 @@ class DocumentProcessor:
                         )
                         logger.info(f"Task {task_id} 高亮完成: {stats.total} sentences highlighted")
                 except Exception as exc:
-                    logger.warning("Highlight post-processing failed, using non-highlighted PDF: %s", exc)
+                    logger.warning(
+                        "Highlight post-processing failed, using non-highlighted PDF: exception_type=%s",
+                        type(exc).__name__,
+                    )
                     self.task_manager.set_highlight_result(
                         task_id,
                         stats_json=json.dumps(
@@ -134,12 +148,16 @@ class DocumentProcessor:
             self.task_manager.set_result(task_id, task_result)
             logger.info(f"Task {task_id} 处理完成 (mode={mode})")
 
-        except DocumentProcessingError as exc:
-            logger.error("处理失败: %s", exc)
+        except TranslationAborted as exc:
+            error_code = str(exc).partition("：")[0] if "：" in str(exc) else "PDF_TRANSLATION_ABORTED"
+            logger.error("PDF 翻译失败: task_id=%s error_code=%s", task_id, error_code)
             self.task_manager.set_error(task_id, str(exc))
+        except DocumentProcessingError:
+            logger.error("处理失败: task_id=%s error_code=DOCUMENT_PROCESSING_FAILED", task_id)
+            self.task_manager.set_error(task_id, "文档处理失败，请重试。")
         except Exception as exc:
-            logger.exception("处理失败: %s", exc)
-            self.task_manager.set_error(task_id, f"处理失败: {exc}")
+            logger.error("处理失败: task_id=%s exception_type=%s", task_id, type(exc).__name__)
+            self.task_manager.set_error(task_id, "文档处理失败，请重试。")
 
     def _translate_with_pdf2zh(
         self,
@@ -150,6 +168,7 @@ class DocumentProcessor:
         ai_loop=None,
         translation_records=None,
         page_publisher=None,
+        ai_client: AIClient | None = None,
     ) -> tuple[bytes, str, bytes | None]:
         """调用 pdf2zh 进行翻译或简化
 
@@ -225,7 +244,11 @@ class DocumentProcessor:
             try:
                 # 调用 pdf2zh
                 with pdf2zh_backend(
-                    self.config.llm, self.ai, ai_loop, records=translation_records, pages=page_publisher
+                    getattr(ai_client or self.ai, "config", self.config.llm),
+                    ai_client or self.ai,
+                    ai_loop,
+                    records=translation_records,
+                    pages=page_publisher,
                 ) as backend:
                     results = translate(
                         files=[str(input_path)],
@@ -272,24 +295,9 @@ class DocumentProcessor:
 
             except PDFTranslationAbort as exc:
                 raise TranslationAborted(str(exc)) from None
-            except Exception as e:
-                logger.exception(f"pdf2zh 处理失败: {e}")
-                if isinstance(e, DocumentProcessingError):
-                    raise
-                raise DocumentProcessingError(f"pdf2zh 处理失败: {e}") from e
-
-    def _configure_pdf2zh_env(self) -> None:
-        """Publish the LLM config to the process env that pdf2zh reads.
-
-        Set once at construction. All tasks share the same config, so there is no
-        per-task variation to guard against — keeping the env stable lets multiple
-        translations run concurrently (bounded by processing.max_concurrent).
-        """
-        if self.config.llm.provider != "api":
-            return
-        os.environ["OPENAILIKED_BASE_URL"] = self.config.llm.base_url
-        os.environ["OPENAILIKED_API_KEY"] = self.config.llm.api_key
-        os.environ["OPENAILIKED_MODEL"] = self.config.llm.model
+            except Exception as exc:
+                logger.error("pdf2zh 处理失败: task_id=%s exception_type=%s", task_id, type(exc).__name__)
+                raise DocumentProcessingError("PDF 处理失败，请重试。") from None
 
     def _build_simple_preview(self, mode: str = "translate") -> str:
         """生成简单的预览 HTML"""

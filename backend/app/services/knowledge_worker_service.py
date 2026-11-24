@@ -248,7 +248,9 @@ class KnowledgeWorkerService:
             session.add(job)
             session.commit()
 
-    def recover_after_restart(self) -> None:
+    def recover_after_restart(self, *, server_only: bool = False) -> None:
+        if server_only:
+            self._retire_remote_jobs()
         now = datetime.utcnow()
         with Session(self.engine) as session:
             for job in session.exec(select(KnowledgeWorkerJob).where(KnowledgeWorkerJob.status == "claimed")).all():
@@ -257,4 +259,21 @@ class KnowledgeWorkerService:
                 job.claimed_until = None
                 job.updated_at = now
                 session.add(job)
+            session.commit()
+
+    def _retire_remote_jobs(self) -> None:
+        now = datetime.utcnow()
+        detail = "本机处理队列已停用，请在网页上重试以使用账户默认模型。"
+        with Session(self.engine) as session:
+            jobs = session.exec(
+                select(KnowledgeWorkerJob).where(KnowledgeWorkerJob.status.in_(("queued", "claimed")))
+            ).all()
+            for job in jobs:
+                job.status, job.error, job.updated_at = "failed", detail, now
+                job.claim_token = job.claimed_until = job.worker_label = None
+                session.add(job)
+                paper = session.get(PaperKnowledge, job.paper_id)
+                if paper and paper.user_id == job.user_id and paper.extraction_status in {"extracting", "pending"}:
+                    paper.extraction_status, paper.extraction_error, paper.updated_at = "error", detail, now
+                    session.add(paper)
             session.commit()

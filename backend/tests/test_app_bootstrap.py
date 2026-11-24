@@ -18,3 +18,10 @@ def test_main_app_mounts_mcp_route():
 
     paths = {getattr(route, "path", None) for route in app.routes}
     assert "/mcp" in paths
+
+
+def test_main_app_does_not_expose_legacy_account_worker_routes():
+    from app.main import app
+
+    prefixes = ("/api/gloss-worker/", "/api/knowledge-worker/")
+    assert not any(path.startswith(prefixes) for path in app.openapi()["paths"])

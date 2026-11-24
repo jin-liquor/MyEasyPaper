@@ -22,6 +22,7 @@ async def test_extract_start_preserves_existing_title(engine, monkeypatch):
 
     monkeypatch.setattr("app.services.knowledge_extractor.engine", engine)
     extractor = KnowledgeExtractor(api_key="k", model="m", base_url="http://localhost")
+    monkeypatch.setattr("app.services.ai_client.AIClient.for_user", classmethod(lambda cls, _user_id: extractor.ai))
 
     async def fail_pipeline(*_args, **_kwargs):
         raise RuntimeError("stop after start")

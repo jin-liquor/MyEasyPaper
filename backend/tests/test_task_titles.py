@@ -31,6 +31,10 @@ def client_and_manager(monkeypatch, tmp_path, ai=None):
     monkeypatch.setattr(manager_module, "engine", engine)
     manager = TaskManager()
     manager.config = SimpleNamespace(storage=SimpleNamespace(temp_dir=str(tmp_path)))
+    if ai is not None:
+        from app.services.ai_client import AIClient
+
+        monkeypatch.setattr(AIClient, "for_user", classmethod(lambda cls, _user_id: ai))
 
     async def process(*args, **kwargs):
         pass

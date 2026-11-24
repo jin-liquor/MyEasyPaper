@@ -13,6 +13,7 @@ import { useFeatures } from "@/lib/features";
 import { EXPORT_FORMATS, exportKnowledge, type ExportFormat } from "@/lib/knowledge-export";
 import { normalizeUserPreferences, useUserPreferences, type UserPreferences } from "@/lib/preferences";
 import { currentEmail, logout } from "@/lib/session";
+import AISettings from "@/components/settings/AISettings";
 
 interface ObsidianVault {
   name: string;
@@ -142,6 +143,7 @@ export default function Settings() {
         <nav className="settings-nav" aria-label="设置分类">
           <a href="#reading-settings">阅读与点读</a>
           <a href="#connection-settings">连接与同步</a>
+          <a href="#ai-settings">AI 模型</a>
           <a href="#data-settings">数据与导出</a>
           <a href="#account-settings">账户</a>
         </nav>
@@ -311,6 +313,11 @@ export default function Settings() {
                 </div>
               </div>
             )}
+            <div id="ai-settings" className="ai-settings-section">
+              <h3>AI 模型</h3>
+              <p>管理当前账户的模型供应商、能力参数与默认模型。</p>
+              <AISettings />
+            </div>
           </section>
 
           <section id="data-settings" className="settings-section">
